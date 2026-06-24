@@ -30,4 +30,4 @@ jobs:
           PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
           BOOK_KEY: "赘婿"
-        run: python crawler.py
+        run: python -u crawler.py
