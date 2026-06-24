@@ -90,30 +90,33 @@ async def login(playwright):
 # ===== 目录抓取（使用 Playwright 页面） =====
 async def fetch_chapters(browser, cookies_dict):
     """使用已登录的 browser 创建新页面，抓取所有章节"""
-    context = await browser.new_context(user_agent=USER_AGENT)  # 新建上下文，会自动继承 browser 的 Cookie？不，需要手动设置
-    # 更安全：手动添加 cookies
+    context = await browser.new_context(user_agent=USER_AGENT)
     await context.add_cookies([
         {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
         for k, v in cookies_dict.items()
     ])
     page = await context.new_page()
-
     chapters = []
     max_page = 1
 
     print("正在获取首页目录...")
+    # 确保 sort=asc 正序
     await page.goto(f"{BASE_DIR_URL}?page=1&sort=asc", wait_until="domcontentloaded", timeout=30000)
+    # 等待播放列表和分页区域
     await page.wait_for_selector("#playlist", timeout=15000)
+    await page.wait_for_selector(".chapter-list-block", timeout=10000)
 
-    # 解析总页数
-    page_links = await page.query_selector_all(".chapter-list-block li a")
+    # 解析总页数（正确的选择器）
+    page_links = await page.query_selector_all(".chapter-list-block .chapter-item a")
     for a in page_links:
-        href = await a.get_attribute("href")
-        if href and (m := re.search(r"page=(\d+)", href)):
-            max_page = max(max_page, int(m.group(1)))
+        href = await a.get_attribute("href") or ""
+        if "page=" in href:
+            match = re.search(r"page=(\d+)", href)
+            if match:
+                max_page = max(max_page, int(match.group(1)))
     print(f"📖 共 {max_page} 页")
 
-    # 解析当前页章节
+    # 提取当前页章节
     async def parse_current_page():
         items = await page.query_selector_all("#playlist ul li a")
         chs = []
@@ -124,10 +127,12 @@ async def fetch_chapters(browser, cookies_dict):
                 chs.append({"title": title.strip(), "url": BASE_URL + url})
         return chs
 
+    # 第一页
     chs = await parse_current_page()
     chapters.extend(chs)
-    print(f"  第1页获取 {len(chs)} 集")
+    print(f"  第1页获取 {len(chs)} 集，首个标题: {chs[0]['title'] if chs else '无'}")
 
+    # 后续分页
     for pg in range(2, max_page + 1):
         print(f"  抓取第 {pg}/{max_page} 页...", end=" ")
         try:
