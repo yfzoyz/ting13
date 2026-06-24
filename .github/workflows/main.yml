@@ -1,6 +1,6 @@
 name: 有声小说爬虫
 
-on:
+于:
   schedule:
     - cron: '0 5 * * *'
   workflow_dispatch:
@@ -31,4 +31,4 @@ jobs:
           PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
           BOOK_KEY: "赘婿"
-        run: python crawler.py
+        run: python -u crawler.py
