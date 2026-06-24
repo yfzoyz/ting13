@@ -60,6 +60,20 @@ jobs:
           BOOK_KEY: "赘婿"
         run: python -u crawler.py
 
+      - name: 推送 progress.json 到公开仓库
+        if: always()
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add progress.json
+          if git diff --staged --quiet; then
+            echo "进度无变化，跳过提交"
+          else
+            git commit -m "Update progress.json"
+            git push origin main
+            echo "✅ 进度已推送到公开仓库"
+          fi
+
       - name: 清理历史运行记录
         if: always()
         uses: Mattraks/delete-workflow-runs@v2
