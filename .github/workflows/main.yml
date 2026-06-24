@@ -1,16 +1,20 @@
-name: 有声小说爬虫测试
+name: 有声小说爬虫
 
 on:
-  workflow_dispatch:          # 手动触发，避免定时抓取
-  # push:
-  #   branches: [ main ]
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: 检出代码
+      - name: 检出公开仓库
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
 
       - name: 设置 Python
         uses: actions/setup-python@v5
@@ -18,11 +22,13 @@ jobs:
           python-version: '3.11'
 
       - name: 安装依赖
-        run: |
-          pip install requests beautifulsoup4 playwright
-          playwright install --with-deps chromium
+        run: pip install requests beautifulsoup4 playwright
+             && playwright install --with-deps chromium
 
-      - name: 运行完整爬虫
+      - name: 运行爬虫
         env:
           TING13_COOKIES: ${{ secrets.TING13_COOKIES }}
-        run: python crawler_full.py
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          BOOK_KEY: "赘婿"
+        run: python crawler.py
