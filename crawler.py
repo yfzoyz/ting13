@@ -3,7 +3,6 @@ from playwright.async_api import async_playwright
 
 BASE_URL = "https://www.ting13.cc"
 BOOK_KEY = os.environ.get("BOOK_KEY", "赘婿")
-# 修正后的目录页 URL
 BOOK_URLS = {"赘婿": f"{BASE_URL}/tingdirs/uiPlHh/cbbhASacUDucKtDb.html"}
 BASE_DIR_URL = BOOK_URLS[BOOK_KEY]
 MAX_PER_RUN = 50
@@ -24,7 +23,6 @@ def sanitize_filename(title):
     name = re.sub(r'[\\/*?:"<>|]', "", title)
     return name[:80].strip()
 
-# ===== 登录 =====
 async def login(playwright):
     raw = os.environ.get("TING13", "")
     if "-----" not in raw: raise RuntimeError("TING13 格式错误")
@@ -75,18 +73,18 @@ async def login(playwright):
     await context.close()
     return browser, cookie_dict
 
-# ===== 目录抓取（已修复） =====
 async def fetch_chapters(browser, cookies_dict):
     context = await browser.new_context(user_agent=USER_AGENT)
-    await context.add_cookies([{"name": k, "value": v, "domain": ".ting13.cc", "path": "/"} for k, v in cookies_dict.items()])
+    await context.add_cookies([
+        {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
+        for k, v in cookies_dict.items()
+    ])
     page = await context.new_page()
-    chapters = []
 
     print("正在获取首页目录...")
-    await page.goto(f"{BASE_DIR_URL}?page=1&sort=asc", wait_until="domcontentloaded", timeout=30000)
+    await page.goto(f"{BASE_DIR_URL}?page=1&sort=asc", wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_selector("#playlist", timeout=15000)
 
-    # 提取最大页码（从快速选集区块）
     max_page = await page.evaluate('''() => {
         const items = document.querySelectorAll('.chapter-list-block a[href*="page="]');
         let max = 1;
@@ -101,7 +99,6 @@ async def fetch_chapters(browser, cookies_dict):
     }''')
     print(f"📖 共 {max_page} 页")
 
-    # 解析当前页章节
     async def parse_current_page():
         items = await page.query_selector_all("#playlist ul li a")
         chs = []
@@ -112,46 +109,39 @@ async def fetch_chapters(browser, cookies_dict):
                 chs.append({"title": title.strip(), "url": BASE_URL + url})
         return chs
 
-    # 抓取第一页
+    chapters = []
     chs = await parse_current_page()
     chapters.extend(chs)
-    first_title = chs[0]['title'] if chs else '无'
-    print(f"  第1页获取 {len(chs)} 集，首个标题: {first_title}")
+    print(f"  第1页获取 {len(chs)} 集，首个: {chs[0]['title'] if chs else '无'}")
 
-    # 检测是否为降序（首个章节包含的数字大于100）
-    is_descending = False
-    nums = re.findall(r'\d+', first_title)
-    if nums and int(nums[0]) > 100:
-        is_descending = True
-        print("  ⚠️ 检测到为降序排列，将在最后反转列表。")
-
-    # 抓取剩余页面
     for pg in range(2, max_page + 1):
-        print(f"  抓取第 {pg}/{max_page} 页...", end=" ")
-        try:
-            await page.goto(f"{BASE_DIR_URL}?page={pg}&sort=asc", wait_until="domcontentloaded", timeout=15000)
-            await page.wait_for_selector("#playlist", timeout=10000)
-            chs = await parse_current_page()
-            chapters.extend(chs)
-            print(f"获取 {len(chs)} 集")
-        except Exception as e:
-            print(f"失败: {e}")
-        await asyncio.sleep(1)
+        success = False
+        for retry in range(3):
+            try:
+                print(f"  抓取第 {pg}/{max_page} 页 (尝试 {retry+1}/3)...", end=" ")
+                await page.goto(f"{BASE_DIR_URL}?page={pg}&sort=asc", wait_until="domcontentloaded", timeout=20000)
+                await page.wait_for_selector("#playlist", timeout=15000)
+                chs = await parse_current_page()
+                chapters.extend(chs)
+                print(f"获取 {len(chs)} 集")
+                success = True
+                break
+            except Exception as e:
+                print(f"失败: {e}")
+                await asyncio.sleep(2 * (retry + 1))
+        if not success:
+            print(f"  ❌ 第 {pg} 页最终失败，跳过")
 
     await page.close()
     await context.close()
-
-    # 如果检测为降序，则反转整个列表使其变为正序（第1集在前）
-    if is_descending:
-        chapters.reverse()
-        print("  列表已反转为正序（第1集 -> 最后一集）")
-
     return chapters
 
-# ===== 获取音频地址 =====
 async def fetch_audio_url(browser, play_url, cookies_dict):
     context = await browser.new_context(user_agent=USER_AGENT)
-    await context.add_cookies([{"name": k, "value": v, "domain": ".ting13.cc", "path": "/"} for k, v in cookies_dict.items()])
+    await context.add_cookies([
+        {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
+        for k, v in cookies_dict.items()
+    ])
     page = await context.new_page()
     captured = {}
 
@@ -162,8 +152,7 @@ async def fetch_audio_url(browser, play_url, cookies_dict):
                 if data.get("status") == 200:
                     captured["name"] = data.get("name")
                     captured["url"] = data.get("url")
-            except:
-                pass
+            except: pass
 
     page.on("response", on_response)
     try:
@@ -211,13 +200,20 @@ def update_index_json(repo_path, entries):
     existing = []
     if os.path.exists(idx_path):
         with open(idx_path, "r", encoding="utf-8") as f:
-            try: existing = json.load(f)
-            except: pass
+            try:
+                existing = json.load(f)
+            except:
+                pass
+    # 移除旧的 title 字段（如果存在）
+    for item in existing:
+        item.pop("title", None)
+
     eps = {e["episode"] for e in existing}
     for e in entries:
         if e["episode"] not in eps:
             existing.append(e)
             eps.add(e["episode"])
+
     existing.sort(key=lambda x: x["episode"])
     with open(idx_path, "w", encoding="utf-8") as f:
         json.dump(existing, f, ensure_ascii=False, indent=2)
@@ -253,7 +249,8 @@ async def main():
             name, url = await fetch_audio_url(browser, ch["url"], cookies)
             if not url:
                 print("   ⚠️ 未获取到音频链接"); continue
-            fname = sanitize_filename(name or ch['title']) + ".m4a"
+            base_name = sanitize_filename(name or ch['title'])
+            fname = base_name + ".m4a"
             dest = os.path.join(repo, TARGET_DIR, fname)
             try:
                 download_audio(url, dest)
@@ -261,8 +258,7 @@ async def main():
             except Exception as e:
                 print(f"   ❌ 下载失败: {e}"); continue
             entries.append({
-                "name": fname[:-4],
-                "title": name or ch['title'],
+                "name": base_name,
                 "episode": ep,
                 "url": f"{BOOK_KEY}/{fname}"
             })
