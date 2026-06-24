@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import random
+import string
 import asyncio
 import time
 import requests
@@ -28,32 +30,73 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 
 HEADERS = {
     "User-Agent": USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Cache-Control": "max-age=0",
-    "Sec-Ch-Ua": '"Chromium";v="123", "Not:A-Brand";v="8"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-User": "?1",
-    "Sec-Fetch-Dest": "document",
-    "Upgrade-Insecure-Requests": "1",
-    "Referer": "https://www.ting13.cc/tingdirs/uiPlHh/cbbhASacUDuaQoFc.html?page=9&sort=asc",
 }
 
-def get_cookies():
-    raw = os.environ.get("TING13_COOKIES", "")
+# ===== 登录函数 =====
+def login():
+    """使用账号密码登录，返回带 Cookie 的 requests.Session"""
+    raw = os.environ.get("TING13", "")
     if not raw:
-        raise RuntimeError("未设置 TING13_COOKIES")
-    cookies = {}
-    for item in raw.split("; "):
-        if "=" in item:
-            k, v = item.split("=", 1)
-            cookies[k.strip()] = v.strip()
-    return cookies
+        raise RuntimeError("未设置 TING13 环境变量（格式：账号-----密码）")
+    if "-----" not in raw:
+        raise RuntimeError("TING13 格式错误，应为 账号-----密码")
+    username, password = raw.split("-----", 1)
 
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    # 1. 访问登录页面，获取初始 Cookie
+    print("🔐 正在登录...")
+    resp = session.get(f"{BASE_URL}/user/public/login.html", timeout=15)
+    resp.encoding = 'utf-8'
+
+    # 2. 生成随机 token（模拟滑块验证）
+    token = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    print(f"  生成验证 token: {token}")
+
+    # 3. 提交 token
+    store_resp = session.post(
+        f"{BASE_URL}/user/public/store_token.html",
+        json={"token": token},
+        headers={
+            "Content-Type": "application/json",
+            "Referer": f"{BASE_URL}/user/public/login.html",
+            "Origin": BASE_URL,
+        },
+        timeout=15
+    )
+    print(f"  store_token 状态: {store_resp.status_code}")
+
+    # 4. 提交登录表单
+    login_data = {
+        "username": username,
+        "password": password,
+        "verificationToken": token,
+        "name": "1",
+    }
+    login_resp = session.post(
+        f"{BASE_URL}/user/public/login.html",
+        data=login_data,
+        headers={
+            "Referer": f"{BASE_URL}/user/public/login.html",
+            "Origin": BASE_URL,
+        },
+        timeout=15
+    )
+    login_resp.encoding = 'utf-8'
+    print(f"  登录 POST 状态: {login_resp.status_code}")
+
+    # 5. 验证登录是否成功（检查 Cookie 中是否有 PTCMS_userid）
+    if "PTCMS_userid" not in session.cookies:
+        # 可能登录失败，打印部分响应文本
+        print("❌ 登录失败，响应片段：", login_resp.text[:300])
+        raise RuntimeError("登录失败，请检查账号密码是否正确")
+    print(f"✅ 登录成功，用户 ID: {session.cookies.get('PTCMS_userid')}")
+    return session
+
+# ===== 工具函数 =====
 def load_progress():
     if not os.path.exists(PROGRESS_FILE):
         return {}
@@ -70,23 +113,16 @@ def sanitize_filename(title):
         name = name[:80]
     return name.strip()
 
-def fetch_chapters_with_requests(cookies):
-    """使用 requests + BeautifulSoup 抓取所有分页的章节链接"""
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    session.cookies.update(cookies)
-
+def fetch_chapters(session):
+    """使用已登录的 session 抓取所有分页的章节链接"""
     all_chapters = []
     max_page = 1
 
     print(f"正在获取首页: {BASE_DIR_URL}?page=1&sort=asc")
-    try:
-        resp = session.get(f"{BASE_DIR_URL}?page=1&sort=asc", timeout=15)
-        resp.encoding = 'utf-8'
-        if resp.status_code != 200:
-            raise RuntimeError(f"首页状态码 {resp.status_code}")
-    except Exception as e:
-        raise RuntimeError(f"请求首页失败: {e}")
+    resp = session.get(f"{BASE_DIR_URL}?page=1&sort=asc", timeout=15)
+    resp.encoding = 'utf-8'
+    if resp.status_code != 200:
+        raise RuntimeError(f"首页状态码 {resp.status_code}")
 
     soup = BeautifulSoup(resp.text, 'html.parser')
 
@@ -101,18 +137,11 @@ def fetch_chapters_with_requests(cookies):
                 max_page = p
     print(f"📖 共检测到 {max_page} 页")
 
-    # 解析第一页的章节
+    # 解析第一页
     playlist = soup.find("div", id="playlist")
     if not playlist:
-        # 打印调试信息
-        title_tag = soup.find("title")
-        page_title = title_tag.string if title_tag else "无标题"
-        print(f"❌ 未找到播放列表容器！")
-        print(f"页面标题：{page_title}")
-        print(f"页面文本片段（前500字符）：\n{resp.text[:500]}")
-        print("可能原因：Cookie 已过期，请更新 TING13_COOKIES")
+        print("❌ 未找到播放列表，可能是未登录或页面结构变化")
         return []
-    
     chapter_count = 0
     for li in playlist.find_all("li"):
         a = li.find("a")
@@ -124,7 +153,7 @@ def fetch_chapters_with_requests(cookies):
             chapter_count += 1
     print(f"  第1页获取 {chapter_count} 集")
 
-    # 获取剩余页面
+    # 剩余页面
     for pg in range(2, max_page + 1):
         print(f"  抓取第 {pg}/{max_page} 页...", end=" ")
         try:
@@ -192,7 +221,6 @@ async def fetch_audio_url(play_url, cookies):
         return captured.get("name", ""), captured.get("url", "")
 
 def download_audio(url, filepath):
-    """下载音频，自动创建父目录"""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     resp = requests.get(url, headers={"User-Agent": USER_AGENT}, stream=True, timeout=120)
     resp.raise_for_status()
@@ -220,7 +248,7 @@ def commit_and_push(repo_path, message):
     else:
         print("ℹ️ 没有文件变更，无需推送")
 
-def update_index_json(repo_path, book_key, entries):
+def update_index_json(repo_path, entries):
     index_dir = os.path.join(repo_path, TARGET_DIR)
     os.makedirs(index_dir, exist_ok=True)
     index_path = os.path.join(index_dir, "index.json")
@@ -246,35 +274,39 @@ def update_index_json(repo_path, book_key, entries):
 
 # ===== 主流程 =====
 async def main():
-    cookies = get_cookies()
+    # 1. 登录
+    session = login()
 
-    # 1. 读取进度
+    # 2. 读取进度
     progress = load_progress()
     book_progress = progress.get(BOOK_KEY, {"last_index": 0, "total_chapters": 0})
     start_index = book_progress["last_index"] + 1
     print(f"📖 当前进度：{BOOK_KEY} 已爬取 {book_progress['last_index']} 集，从第 {start_index} 集开始")
 
-    # 2. 获取完整章节列表
-    chapters = fetch_chapters_with_requests(cookies)
+    # 3. 获取全部章节列表
+    chapters = fetch_chapters(session)
     total_chapters = len(chapters)
     print(f"📚 共获取到 {total_chapters} 个章节")
     if total_chapters == 0:
-        print("❌ 章节列表为空，请检查 Cookie 是否有效或网站是否可访问。退出。")
+        print("❌ 章节列表为空，退出")
         return
 
     book_progress["total_chapters"] = total_chapters
 
-    # 3. 确定本次范围
+    # 4. 确定本次处理范围
     end_index = min(start_index + MAX_PER_RUN - 1, total_chapters)
     if start_index > total_chapters:
         print("✅ 所有章节已爬取完毕")
         return
     print(f"⚡ 本次处理第 {start_index} ~ {end_index} 集")
 
-    # 4. 克隆私有仓库
+    # 5. 克隆私有仓库
     repo_path = clone_private_repo()
 
-    # 5. 逐章处理
+    # 6. 提取 cookies 字典用于 Playwright
+    cookies = session.cookies.get_dict()
+
+    # 7. 逐章下载
     new_entries = []
     for idx in range(start_index - 1, end_index):
         ch = chapters[idx]
@@ -307,14 +339,14 @@ async def main():
         })
         time.sleep(1)
 
-    # 6. 更新索引并推送
+    # 8. 更新索引并推送
     if new_entries:
-        update_index_json(repo_path, BOOK_KEY, new_entries)
+        update_index_json(repo_path, new_entries)
         commit_and_push(repo_path, f"抓取 {BOOK_KEY} 第{start_index}-{end_index}集")
     else:
         print("ℹ️ 本次未下载任何新音频")
 
-    # 7. 保存进度
+    # 9. 更新进度
     if new_entries:
         book_progress["last_index"] = end_index
         progress[BOOK_KEY] = book_progress
