@@ -24,17 +24,20 @@ def sanitize_filename(title):
     name = re.sub(r'[\\/*?:"<>|]', "", title)
     return name[:80].strip()
 
-# ===== 登录，返回 (cookie_dict, browser, context) =====
+# ===== 登录 =====
 async def login(playwright):
     raw = os.environ.get("TING13", "")
-    if "-----" not in raw:
-        raise RuntimeError("TING13 格式错误")
+    if "-----" not in raw: raise RuntimeError("TING13 格式错误")
     username, password = raw.split("-----", 1)
 
     browser = await playwright.chromium.launch(
-        headless=True, args=["--no-sandbox", "--disable-http2", "--disable-gpu"]
+        headless=True,
+        args=["--no-sandbox", "--disable-http2", "--disable-gpu"]
     )
-    context = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 720})
+    context = await browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1280, "height": 720}
+    )
     page = await context.new_page()
 
     print("🔐 正在打开登录页面...")
@@ -44,9 +47,8 @@ async def login(playwright):
 
     await page.fill('input[name="username"]', username)
     await page.fill('input[name="password"]', password)
-    await asyncio.sleep(0.5)
 
-    print("  使用 JS 完整模拟登录流程...")
+    print("  使用 JS 完成滑块验证...")
     await page.evaluate('''() => {
         const slider = document.getElementById('slider');
         const container = slider.parentElement;
@@ -59,136 +61,101 @@ async def login(playwright):
         document.getElementById('loginButton').disabled = false;
         window._loginToken = token;
     }''')
-
-    await asyncio.sleep(0.5)
     token = await page.evaluate("() => window._loginToken")
-    print(f"  生成 token: {token}")
 
-    print("  POST store_token.html...")
-    store_resp = await page.evaluate('''async (token) => {
-        try {
-            const resp = await fetch('/user/public/store_token.html', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({token: token})
-            });
-            return {status: resp.status, ok: resp.ok};
-        } catch(e) { return {error: e.toString()}; }
+    await page.evaluate('''async (token) => {
+        await fetch('/user/public/store_token.html', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({token: token})
+        });
     }''', token)
-    print(f"  store_token 响应: {store_resp}")
-    await asyncio.sleep(0.5)
 
-    print("  提交登录表单，等待跳转...")
-    try:
-        async with page.expect_navigation(
-            url="**/user/index/index.html",
-            wait_until="domcontentloaded",
-            timeout=30000
-        ):
-            await page.evaluate("() => document.getElementById('frmpassedit').submit()")
-        print("✅ 登录成功（form submit）")
-    except Exception as e:
-        print(f"  form submit 超时: {e}")
-        if "user/index" not in page.url:
-            try:
-                async with page.expect_navigation(
-                    url="**/user/index/index.html",
-                    wait_until="domcontentloaded",
-                    timeout=15000
-                ):
-                    await page.click("#loginButton")
-            except Exception as e2:
-                print(f"  点击按钮也失败: {e2}")
-                ck = await context.cookies()
-                if "PTCMS_userid" not in [c['name'] for c in ck]:
-                    await browser.close()
-                    raise RuntimeError(f"登录失败，当前页面: {page.url}")
-
-    await page.close()
+    print("  提交登录表单...")
+    async with page.expect_navigation(url="**/user/index/index.html", wait_until="domcontentloaded", timeout=30000):
+        await page.evaluate("document.getElementById('frmpassedit').submit()")
+    print("✅ 登录成功")
 
     cookies = await context.cookies()
     cookie_dict = {c['name']: c['value'] for c in cookies}
-    if "PTCMS_userid" not in cookie_dict:
-        await browser.close()
-        raise RuntimeError("登录失败：未获取到 PTCMS_userid cookie")
+    return browser, cookie_dict
 
-    print(f"✅ 登录验证通过，用户ID: {cookie_dict.get('PTCMS_userid')}")
-    # 返回 context（保持登录状态），调用者负责关闭 browser
-    return cookie_dict, browser, context
-
-
-# ===== 目录抓取：复用已登录的 browser context =====
-async def fetch_chapters(context):
-    """用已登录的 Playwright context 抓取目录，确保 cookies/session 完整"""
-
-    def parse_chapters(html):
-        s = BeautifulSoup(html, 'html.parser')
-        playlist_div = s.find("div", id="playlist")
-        if not playlist_div:
-            # 调试：打印页面片段
-            snippet = html[html.find('<div class="book"'):html.find('<div class="book"') + 500] if '<div class="book"' in html else html[:500]
-            print(f"  ⚠️ 未找到 #playlist，页面片段: {snippet[:200]}")
-            return []
-        results = []
-        for li in playlist_div.find_all("li"):
-            a = li.find("a")
-            if not a or not a.get("href"):
-                continue
-            href = a["href"].strip()
-            if not href.startswith("/play/"):
-                continue
-            title = a.get("title", "").strip() or a.get_text(strip=True)
-            results.append({"title": title, "url": BASE_URL + href})
-        return results
-
-    def get_max_page(html):
-        s = BeautifulSoup(html, 'html.parser')
-        max_page = 1
-        ul = s.find("ul", class_="js_chapter_ul")
-        if ul:
-            for a in ul.find_all("a", href=True):
-                m = re.search(r"page=(\d+)", a["href"])
-                if m:
-                    max_page = max(max_page, int(m.group(1)))
-        return max_page
-
+# ===== 目录抓取 =====
+async def fetch_chapters(browser, cookies_dict):
+    context = await browser.new_context(user_agent=USER_AGENT)
+    await context.add_cookies([
+        {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
+        for k, v in cookies_dict.items()
+    ])
     page = await context.new_page()
     chapters = []
 
-    try:
-        # 第一页
-        url1 = f"{BASE_DIR_URL}?page=1&sort=asc"
-        print(f"  请求目录第1页: {url1}")
-        await page.goto(url1, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(2)  # 等待 JS 渲染
+    print("正在获取首页目录...")
+    await page.goto(f"{BASE_DIR_URL}?page=1&sort=asc", wait_until="domcontentloaded", timeout=30000)
+    await page.wait_for_selector("#playlist", timeout=15000)
 
-        html1 = await page.content()
-        max_page = get_max_page(html1)
-        print(f"📖 共 {max_page} 页")
+    # 使用 evaluate 提取最大页码
+    max_page = await page.evaluate('''() => {
+        const links = document.querySelectorAll('a[href*="page="]');
+        let max = 1;
+        links.forEach(a => {
+            const m = a.href.match(/page=(\d+)/);
+            if (m) {
+                const num = parseInt(m[1], 10);
+                if (num > max) max = num;
+            }
+        });
+        return max;
+    }''')
+    print(f"📖 共 {max_page} 页")
 
-        chs1 = parse_chapters(html1)
-        chapters += chs1
-        print(f"  第1页: {len(chs1)} 集")
+    async def parse_current_page():
+        items = await page.query_selector_all("#playlist ul li a")
+        chs = []
+        for a in items:
+            title = await a.get_attribute("title") or ""
+            url = await a.get_attribute("href") or ""
+            if url:
+                chs.append({"title": title.strip(), "url": BASE_URL + url})
+        return chs
 
-        # 后续页
-        for pg in range(2, max_page + 1):
-            url_pg = f"{BASE_DIR_URL}?page={pg}&sort=asc"
-            await page.goto(url_pg, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(1)
-            html_pg = await page.content()
-            chs = parse_chapters(html_pg)
-            chapters += chs
-            print(f"  第{pg}页: {len(chs)} 集")
+    chs = await parse_current_page()
+    chapters.extend(chs)
+    first_title = chs[0]['title'] if chs else '无'
+    print(f"  第1页获取 {len(chs)} 集，首个标题: {first_title}")
 
-    finally:
-        await page.close()
+    # 如果首个标题不是第1集，则可能是降序，强制重新请求正序
+    if "第1集" not in first_title and "赘婿第一章" not in first_title:
+        print("  ⚠️ 发现排序可能为降序，重新请求正序...")
+        await page.goto(f"{BASE_DIR_URL}?page=1&sort=asc", wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_selector("#playlist", timeout=15000)
+        chs = await parse_current_page()
+        chapters = chs
+        print(f"  重新获取第1页: {len(chs)} 集，首个: {chs[0]['title'] if chs else '无'}")
 
+    for pg in range(2, max_page + 1):
+        print(f"  抓取第 {pg}/{max_page} 页...", end=" ")
+        try:
+            await page.goto(f"{BASE_DIR_URL}?page={pg}&sort=asc", wait_until="domcontentloaded", timeout=15000)
+            await page.wait_for_selector("#playlist", timeout=10000)
+            chs = await parse_current_page()
+            chapters.extend(chs)
+            print(f"获取 {len(chs)} 集")
+        except Exception as e:
+            print(f"失败: {e}")
+        await asyncio.sleep(1)
+
+    await page.close()
+    await context.close()
     return chapters
 
-
-# ===== 音频地址 =====
-async def fetch_audio_url(context, play_url):
-    """复用已登录的 context 抓取音频链接"""
+# ===== 获取音频地址 =====
+async def fetch_audio_url(browser, play_url, cookies_dict):
+    context = await browser.new_context(user_agent=USER_AGENT)
+    await context.add_cookies([
+        {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
+        for k, v in cookies_dict.items()
+    ])
     page = await context.new_page()
     captured = {}
 
@@ -197,65 +164,49 @@ async def fetch_audio_url(context, play_url):
             try:
                 data = await resp.json()
                 if data.get("status") == 200:
-                    captured["name"] = data.get("name", "")
-                    captured["url"] = data.get("url", "")
-                    print(f"    🎵 捕获: {captured['name']}")
+                    captured["name"] = data.get("name")
+                    captured["url"] = data.get("url")
             except:
                 pass
 
     page.on("response", on_response)
     try:
         await page.goto(play_url, wait_until="domcontentloaded", timeout=30000)
-        # 轮询等待，最多 10 秒
-        for _ in range(20):
-            if captured:
-                break
-            await asyncio.sleep(0.5)
+        await asyncio.sleep(3)
+        await page.evaluate("() => { const btn = document.querySelector('.play-btn,#playButton,.audio-play'); if(btn) btn.click(); }")
+        await asyncio.sleep(3)
     except Exception as e:
         print(f"    播放页异常: {e}")
     finally:
         page.remove_listener("response", on_response)
         await page.close()
-
+        await context.close()
     return captured.get("name", ""), captured.get("url", "")
-
 
 def download_audio(url, filepath):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    resp = requests.get(
-        url, headers={"User-Agent": USER_AGENT}, stream=True, timeout=120
-    )
+    resp = requests.get(url, headers={"User-Agent": USER_AGENT}, stream=True, timeout=120)
     resp.raise_for_status()
     with open(filepath, "wb") as f:
-        for chunk in resp.iter_content(8192):
-            f.write(chunk)
+        for chunk in resp.iter_content(8192): f.write(chunk)
     return True
-
 
 def clone_private_repo():
     subprocess.run(["rm", "-rf", "/tmp/private_repo"], check=False)
-    subprocess.run([
-        "git", "clone", "--depth", "1",
-        f"https://{ACCESS_TOKEN}@github.com/{PRIVATE_REPO}.git",
-        "/tmp/private_repo"
-    ], check=True)
+    subprocess.run(["git", "clone", "--depth", "1", f"https://{ACCESS_TOKEN}@github.com/{PRIVATE_REPO}.git", "/tmp/private_repo"], check=True)
     return "/tmp/private_repo"
-
 
 def commit_and_push(repo_path, msg):
     subprocess.run(["git", "-C", repo_path, "config", "user.email", "actions@github.com"], check=True)
     subprocess.run(["git", "-C", repo_path, "config", "user.name", "GitHub Actions"], check=True)
     subprocess.run(["git", "-C", repo_path, "add", "."], check=True)
-    status = subprocess.run(
-        ["git", "-C", repo_path, "status", "--porcelain"], capture_output=True, text=True
-    ).stdout
+    status = subprocess.run(["git", "-C", repo_path, "status", "--porcelain"], capture_output=True, text=True).stdout
     if status.strip():
         subprocess.run(["git", "-C", repo_path, "commit", "-m", msg], check=True)
         subprocess.run(["git", "-C", repo_path, "push", "origin", "main"], check=True)
         print("✅ 私有仓库更新已推送")
     else:
         print("ℹ️ 无变更")
-
 
 def update_index_json(repo_path, entries):
     idx_dir = os.path.join(repo_path, TARGET_DIR)
@@ -276,7 +227,6 @@ def update_index_json(repo_path, entries):
         json.dump(existing, f, ensure_ascii=False, indent=2)
     print(f"📄 index.json 更新至 {len(existing)} 集")
 
-
 async def main():
     progress = load_progress()
     bp = progress.get(BOOK_KEY, {"last_index": 0, "total_chapters": 0})
@@ -284,63 +234,53 @@ async def main():
     print(f"📖 {BOOK_KEY} 已爬 {bp['last_index']} 集，从第 {start} 集开始")
 
     async with async_playwright() as p:
-        cookie_dict, browser, context = await login(p)
-
-        try:
-            # 用同一个已登录的 context 抓目录
-            chapters = await fetch_chapters(context)
-
-            total = len(chapters)
-            print(f"📚 共获取 {total} 章节")
-            if not total:
-                return
-
-            bp["total_chapters"] = total
-            end = min(start + MAX_PER_RUN - 1, total)
-            if start > total:
-                print("✅ 已全部爬完")
-                return
-            print(f"⚡ 本次: 第{start}-{end}集")
-
-            repo = clone_private_repo()
-            entries = []
-
-            for i in range(start - 1, end):
-                ch = chapters[i]
-                ep = i + 1
-                print(f"\n🎯 第{ep}集: {ch['title']}")
-                # 复用同一 context 抓音频
-                name, url = await fetch_audio_url(context, ch["url"])
-                if not url:
-                    print("   ⚠️ 未获取到音频链接")
-                    continue
-                fname = sanitize_filename(name or ch['title']) + ".m4a"
-                dest = os.path.join(repo, TARGET_DIR, fname)
-                try:
-                    download_audio(url, dest)
-                    print(f"   ✅ 下载成功: {fname}")
-                except Exception as e:
-                    print(f"   ❌ 下载失败: {e}")
-                    continue
-                entries.append({
-                    "name": fname[:-4],
-                    "title": name or ch['title'],
-                    "episode": ep,
-                    "url": f"{BOOK_KEY}/{fname}"
-                })
-                await asyncio.sleep(1)
-
-            if entries:
-                update_index_json(repo, entries)
-                commit_and_push(repo, f"抓取 {BOOK_KEY} 第{start}-{end}集")
-                bp["last_index"] = end
-                progress[BOOK_KEY] = bp
-                save_progress(progress)
-                print(f"📈 进度已更新: last_index={end}")
-
-        finally:
+        browser, cookies = await login(p)
+        chapters = await fetch_chapters(browser, cookies)
+        total = len(chapters)
+        print(f"📚 共获取 {total} 章节")
+        if not total:
             await browser.close()
+            return
+        bp["total_chapters"] = total
+        end = min(start + MAX_PER_RUN - 1, total)
+        if start > total:
+            print("✅ 已全部爬完")
+            await browser.close()
+            return
+        print(f"⚡ 本次: 第{start}-{end}集")
 
+        repo = clone_private_repo()
+        entries = []
+        for i in range(start - 1, end):
+            ch = chapters[i]; ep = i + 1
+            print(f"\n🎯 第{ep}集: {ch['title']}")
+            name, url = await fetch_audio_url(browser, ch["url"], cookies)
+            if not url:
+                print("   ⚠️ 未获取到音频链接"); continue
+            fname = sanitize_filename(name or ch['title']) + ".m4a"
+            dest = os.path.join(repo, TARGET_DIR, fname)
+            try:
+                download_audio(url, dest)
+                print(f"   ✅ 下载成功: {fname}")
+            except Exception as e:
+                print(f"   ❌ 下载失败: {e}"); continue
+            entries.append({
+                "name": fname[:-4],
+                "title": name or ch['title'],
+                "episode": ep,
+                "url": f"{BOOK_KEY}/{fname}"
+            })
+            await asyncio.sleep(1)
+
+        if entries:
+            update_index_json(repo, entries)
+            commit_and_push(repo, f"抓取 {BOOK_KEY} 第{start}-{end}集")
+            bp["last_index"] = end
+            progress[BOOK_KEY] = bp
+            save_progress(progress)
+            print(f"📈 进度已更新: last_index={end}")
+
+        await browser.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
