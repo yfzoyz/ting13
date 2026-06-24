@@ -46,47 +46,32 @@ async def login(playwright):
     await page.wait_for_selector("#slider", state="visible", timeout=15000)
     await asyncio.sleep(2)
 
-    # 填入账号密码
     await page.fill('input[name="username"]', username)
     await page.fill('input[name="password"]', password)
     await asyncio.sleep(0.5)
 
-    # ===== 方案：JS 直接模拟完整登录流程 =====
-    # 1. 生成 token
-    # 2. POST store_token.html
-    # 3. 等待完成后 submit 表单
-    # 全程在页面 JS 中执行，Playwright 只需等待跳转
-    
     print("  使用 JS 完整模拟登录流程...")
-    
-    # 先设置验证状态（不触发 submit）
+
+    # 设置验证状态（不触发 submit）
     await page.evaluate('''() => {
         const slider = document.getElementById('slider');
         const container = slider.parentElement;
-        // 移动滑块到最右
         slider.style.left = (container.offsetWidth - slider.offsetWidth) + 'px';
-        // 更新文本
         document.getElementById('sliderText').innerText = '验证通过';
-        // 生成 token
         const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
         let token = '';
         for (let i = 0; i < 16; i++) {
             token += chars.charAt(Math.floor(Math.random() * chars.length));
         }
         document.getElementById('verificationToken').value = token;
-        // 启用按钮
         document.getElementById('loginButton').disabled = false;
-        // 存储 token 到 window 供外部读取
         window._loginToken = token;
     }''')
-    
+
     await asyncio.sleep(0.5)
-    
-    # 读取生成的 token
     token = await page.evaluate("() => window._loginToken")
     print(f"  生成 token: {token}")
-    
-    # POST store_token.html（模拟 fetch）
+
     print("  POST store_token.html...")
     store_resp = await page.evaluate('''async (token) => {
         try {
@@ -101,10 +86,9 @@ async def login(playwright):
         }
     }''', token)
     print(f"  store_token 响应: {store_resp}")
-    
+
     await asyncio.sleep(0.5)
-    
-    # 提交表单 + 等待跳转（并发执行，避免时序问题）
+
     print("  提交登录表单，等待跳转...")
     try:
         async with page.expect_navigation(
@@ -116,15 +100,9 @@ async def login(playwright):
         print("✅ 登录成功（form submit）")
     except Exception as e:
         print(f"  form submit 等待超时: {e}")
-        # 检查当前 URL
         current_url = page.url
         print(f"  当前页面: {current_url}")
-        
-        if "user/index" in current_url:
-            print("✅ 实际上已登录成功")
-        else:
-            # 最后尝试：直接点击登录按钮
-            print("  尝试点击登录按钮...")
+        if "user/index" not in current_url:
             try:
                 async with page.expect_navigation(
                     url="**/user/index/index.html",
@@ -134,67 +112,70 @@ async def login(playwright):
                     await page.click("#loginButton")
             except Exception as e2:
                 print(f"  点击按钮也失败: {e2}")
-                # 最终检查 cookie
                 cookies = await context.cookies()
-                cookie_names = [c['name'] for c in cookies]
-                print(f"  当前 cookies: {cookie_names}")
-                if "PTCMS_userid" not in cookie_names:
+                if "PTCMS_userid" not in [c['name'] for c in cookies]:
                     await browser.close()
                     raise RuntimeError(f"登录失败，当前页面: {page.url}")
 
-    # 验证登录 cookie
     cookies = await context.cookies()
     cookie_dict = {c['name']: c['value'] for c in cookies}
     if "PTCMS_userid" not in cookie_dict:
         await browser.close()
         raise RuntimeError("登录失败：未获取到 PTCMS_userid cookie")
-    
+
     print(f"✅ 登录验证通过，用户ID: {cookie_dict.get('PTCMS_userid')}")
     await browser.close()
     return cookie_dict
 
 
-# ===== 目录抓取 =====
-async def fetch_chapters(playwright, cookies_dict):
-    req_ctx = await playwright.request.new_context(user_agent=USER_AGENT)
-    await req_ctx.add_cookies([
-        {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
-        for k, v in cookies_dict.items()
-    ])
-
-    chapters = []
-    max_page = 1
-    resp = await req_ctx.get(f"{BASE_DIR_URL}?page=1&sort=asc")
-    soup = BeautifulSoup(await resp.text(), 'html.parser')
-    for a in soup.select(".chapter-list-block li a"):
-        if m := re.search(r"page=(\d+)", a.get("href", "")):
-            max_page = max(max_page, int(m.group(1)))
-    print(f"📖 共 {max_page} 页")
+# ===== 目录抓取：改用 requests 库携带 cookies =====
+def fetch_chapters_sync(cookies_dict):
+    """用同步 requests 抓取目录，避免 Playwright APIRequestContext 的 cookie 问题"""
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+    # 设置 cookies
+    for name, value in cookies_dict.items():
+        session.cookies.set(name, value, domain="www.ting13.cc")
 
     def parse_page(html):
         s = BeautifulSoup(html, 'html.parser')
         div = s.find("div", id="playlist")
-        if not div: return []
+        if not div:
+            return []
         return [
             {"title": a.get("title", "").strip(), "url": BASE_URL + a["href"]}
             for li in div.find_all("li")
             if (a := li.find("a")) and a.get("href")
         ]
 
-    chapters += parse_page(await resp.text())
+    chapters = []
+    max_page = 1
+
+    # 第一页，探测总页数
+    resp = session.get(f"{BASE_DIR_URL}?page=1&sort=asc", timeout=30)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, 'html.parser')
+
+    # 检测分页
+    for a in soup.select("a[href]"):
+        if m := re.search(r"page=(\d+)", a.get("href", "")):
+            max_page = max(max_page, int(m.group(1)))
+
+    print(f"📖 共 {max_page} 页")
+    chapters += parse_page(resp.text)
     print(f"  第1页: {len(chapters)} 集")
 
     for pg in range(2, max_page + 1):
-        resp = await req_ctx.get(f"{BASE_DIR_URL}?page={pg}&sort=asc")
-        if resp.status != 200:
-            print(f"  第{pg}页 失败 {resp.status}")
-            continue
-        chs = parse_page(await resp.text())
-        chapters += chs
-        print(f"  第{pg}页: {len(chs)} 集")
-        await asyncio.sleep(1)
+        try:
+            resp = session.get(f"{BASE_DIR_URL}?page={pg}&sort=asc", timeout=30)
+            resp.raise_for_status()
+            chs = parse_page(resp.text)
+            chapters += chs
+            print(f"  第{pg}页: {len(chs)} 集")
+            time.sleep(1)
+        except Exception as e:
+            print(f"  第{pg}页 失败: {e}")
 
-    await req_ctx.dispose()
     return chapters
 
 
@@ -310,7 +291,11 @@ async def main():
 
     async with async_playwright() as p:
         cookies = await login(p)
-        chapters = await fetch_chapters(p, cookies)
+
+        # 目录抓取改用同步 requests（在线程池中运行避免阻塞事件循环）
+        loop = asyncio.get_event_loop()
+        chapters = await loop.run_in_executor(None, fetch_chapters_sync, cookies)
+
         total = len(chapters)
         print(f"📚 共获取 {total} 章节")
         if not total:
