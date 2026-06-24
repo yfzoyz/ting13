@@ -1,4 +1,4 @@
-import os, re, json, random, string, asyncio, time, subprocess, requests
+import os, re, json, asyncio, time, subprocess, requests
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 
@@ -45,27 +45,58 @@ async def login(playwright):
     # 滑块验证
     slider = page.locator("#slider")
     container = page.locator(".slider-container")
+    await slider.wait_for(state="visible")
     slider_box = await slider.bounding_box()
     cont_box = await container.bounding_box()
-    if not slider_box or not cont_box: raise RuntimeError("未找到滑块元素")
+    if not slider_box or not cont_box:
+        raise RuntimeError("未找到滑块元素")
 
-    await page.mouse.move(slider_box['x'] + slider_box['width']/2, slider_box['y'] + slider_box['height']/2)
+    start_x = slider_box['x'] + slider_box['width'] / 2
+    start_y = slider_box['y'] + slider_box['height'] / 2
+    end_x = cont_box['x'] + cont_box['width'] - slider_box['width'] / 2
+
+    # 模拟拖拽
+    await page.mouse.move(start_x, start_y)
     await page.mouse.down()
-    await page.mouse.move(cont_box['x'] + cont_box['width'] - slider_box['width']/2, slider_box['y'] + slider_box['height']/2, steps=15)
+    steps = 30
+    for i in range(1, steps + 1):
+        x = start_x + (end_x - start_x) * i / steps
+        await page.mouse.move(x, start_y)
+        await asyncio.sleep(0.05)
     await page.mouse.up()
-    await asyncio.sleep(1)
+    print("  滑块拖拽完成，等待验证...")
+    await asyncio.sleep(2)
 
-    # 点击登录（按钮此时应已可用）
-    await page.click("#loginButton")
-    # 等待跳转到用户中心
-    await page.wait_for_url("**/user/index/index.html", timeout=20000)
+    # 检查滑块状态
+    text = await page.text_content("#sliderText")
+    print(f"  滑块状态: {text}")
+    if "验证通过" not in text:
+        # 可能验证未触发，再等一下
+        await asyncio.sleep(2)
+        text = await page.text_content("#sliderText")
+        if "验证通过" not in text:
+            raise RuntimeError(f"滑块验证失败，当前状态: {text}")
+
+    # 验证通过后，页面会自动提交，等待跳转到用户中心
+    print("  等待登录跳转...")
+    try:
+        await page.wait_for_url("**/user/index/index.html", timeout=30000)
+    except:
+        # 如果未自动跳转，尝试手动点击登录按钮
+        print("  未自动跳转，尝试手动点击登录按钮...")
+        btn = page.locator("#loginButton")
+        if await btn.is_enabled():
+            await btn.click()
+            await page.wait_for_url("**/user/index/index.html", timeout=15000)
+        else:
+            raise RuntimeError("登录失败，按钮仍不可用")
     print("✅ 登录成功")
 
     cookies = await context.cookies()
     await browser.close()
     return {c['name']: c['value'] for c in cookies}
 
-# ===== 获取目录（Playwright APIRequest） =====
+# ===== 获取目录 =====
 async def fetch_chapters(playwright, cookies_dict):
     req_ctx = await playwright.request.new_context(user_agent=USER_AGENT)
     await req_ctx.add_cookies([{"name": k, "value": v, "domain": ".ting13.cc", "path": "/"} for k, v in cookies_dict.items()])
@@ -74,7 +105,6 @@ async def fetch_chapters(playwright, cookies_dict):
     max_page = 1
     resp = await req_ctx.get(f"{BASE_DIR_URL}?page=1&sort=asc")
     soup = BeautifulSoup(await resp.text(), 'html.parser')
-    # 总页数
     for a in soup.select(".chapter-list-block li a"):
         if m := re.search(r"page=(\d+)", a.get("href", "")):
             max_page = max(max_page, int(m.group(1)))
