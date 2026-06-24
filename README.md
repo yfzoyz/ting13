@@ -4,7 +4,7 @@
 
 | 变量名 | 是否必需 | 说明 |
 |--------|----------|------|
-| `TING13_COOKIES` | ✅ 必需 | 登录 `ting13.cc` 后的完整 Cookie 字符串，用于通过登录验证。格式：`key1=value1; key2=value2; ...` |
+| `TING13` | ✅ 必需 | 登录 `格式：账号-----密码` |
 | `PRIVATE_REPO` | ✅ 必需 | 存储音频文件的私有仓库全名，格式为 `owner/repo`（例如 `myuser/audiobooks-private`）。 |
 | `ACCESS_TOKEN` | ✅ 必需 | 具有访问上述私有仓库权限的 GitHub Personal Access Token（需勾选 `repo` 作用域），用于克隆和推送文件。 |
 | `GH_TOKEN` | ✅ 必需 | 用于将 `progress.json` 推回当前公开仓库的 GitHub Token（通常与 `ACCESS_TOKEN` 相同即可）。 |
