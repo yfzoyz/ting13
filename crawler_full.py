@@ -1,140 +1,120 @@
-import os
-import sys
-import json
-import asyncio
-import requests
-from bs4 import BeautifulSoup
+import os, sys, json, asyncio
 from playwright.async_api import async_playwright
 
 BASE_URL = "https://www.ting13.cc"
 DIR_URL = f"{BASE_URL}/tingdirs/uiPlHh/cbbhASacUDuaQoFc.html?page=1&sort=asc"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+MAX_CHAPTERS = 3   # 只爬前3集，可根据需要修改
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Accept-Language": "zh-CN,zh;q=0.9",
-}
-
-def get_cookies_from_env():
-    cookie_str = os.getenv("TING13_COOKIES", "")
-    if not cookie_str:
-        raise RuntimeError("未设置 TING13_COOKIES 环境变量")
+def get_cookies():
+    raw = os.getenv("TING13_COOKIES", "")
+    if not raw:
+        raise RuntimeError("请设置 TING13_COOKIES 环境变量")
     cookies = {}
-    for item in cookie_str.split("; "):
+    for item in raw.split("; "):
         if "=" in item:
-            key, val = item.split("=", 1)
-            cookies[key.strip()] = val.strip()
+            k, v = item.split("=", 1)
+            cookies[k.strip()] = v.strip()
     return cookies
 
-def fetch_directory(cookies):
-    """用 requests 快速提取所有章节链接（前 N 章）"""
-    print(f"正在获取目录: {DIR_URL}")
-    resp = requests.get(DIR_URL, headers=HEADERS, cookies=cookies, timeout=15)
-    resp.encoding = 'utf-8'
-    if resp.status_code != 200:
-        raise RuntimeError(f"目录页状态码 {resp.status_code}")
-    soup = BeautifulSoup(resp.text, 'html.parser')
-    playlist_div = soup.find("div", id="playlist")
-    if not playlist_div:
-        raise RuntimeError("未找到播放列表容器，检查 Cookie")
-    chapters = []
-    for li in playlist_div.find_all("li"):
-        a = li.find("a")
-        if a and a.get("href"):
-            chapters.append({
-                "title": a.get("title", "").strip(),
-                "url": BASE_URL + a["href"]
-            })
-    print(f"提取到 {len(chapters)} 个章节")
-    return chapters
-
-async def get_audio_urls(chapters, cookies, max_chapters=3):
-    """使用 Playwright 依次打开播放页，拦截 /api/mapi/play 响应"""
+async def main():
+    cookies = get_cookies()
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent=HEADERS["User-Agent"],
-            # 将 cookie 字典转换为 Playwright 需要的格式
-            storage_state=None
-        )
-        # 手动添加 cookies
-        cookie_list = []
-        for name, value in cookies.items():
-            cookie_list.append({
-                "name": name,
-                "value": value,
-                "domain": ".ting13.cc",
-                "path": "/"
-            })
-        await context.add_cookies(cookie_list)
+        context = await browser.new_context(user_agent=USER_AGENT)
 
+        # 注入 Cookie
+        await context.add_cookies([
+            {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
+            for k, v in cookies.items()
+        ])
+
+        # ---------- 1. 获取目录页（直接用浏览器） ----------
         page = await context.new_page()
-        audio_results = []
+        print(f"正在打开目录页: {DIR_URL}")
+        try:
+            await page.goto(DIR_URL, wait_until="networkidle", timeout=60000)
+        except Exception as e:
+            print(f"页面加载超时/错误: {e}，继续解析已有内容")
 
-        for idx, ch in enumerate(chapters[:max_chapters], 1):
-            print(f"\n[{idx}/{max_chapters}] 正在处理: {ch['title']}")
-            # 设置请求拦截，捕获 /api/mapi/play 的响应
-            async def handle_response(response):
-                if "/api/mapi/play" in response.url and response.status == 200:
+        # 从 DOM 中提取章节链接
+        chapters = await page.evaluate('''() => {
+            const ul = document.querySelector("#playlist ul");
+            if (!ul) return [];
+            const lis = ul.querySelectorAll("li");
+            return Array.from(lis).map(li => {
+                const a = li.querySelector("a");
+                return a ? { title: a.getAttribute("title") || a.innerText.trim(), url: a.href } : null;
+            }).filter(Boolean);
+        }''')
+
+        if not chapters:
+            print("❌ 未找到章节列表，页面标题:", await page.title())
+            sys.exit(1)
+
+        print(f"✅ 成功提取 {len(chapters)} 个章节")
+        for i, ch in enumerate(chapters[:3]):
+            print(f"   {i+1}. {ch['title']}")
+
+        await page.close()  # 关闭目录页
+
+        # ---------- 2. 逐个打开播放页，拦截音频地址 ----------
+        audio_data = []
+        for idx, ch in enumerate(chapters[:MAX_CHAPTERS], 1):
+            print(f"\n[{idx}/{MAX_CHAPTERS}] 打开: {ch['title']}")
+            play_page = await context.new_page()
+            captured = {}
+
+            async def on_response(resp):
+                if "/api/mapi/play" in resp.url and resp.status == 200:
                     try:
-                        data = await response.json()
-                        if data.get("status") == 200:
-                            audio_url = data.get("url")
-                            audio_name = data.get("name")
-                            print(f"  -> 音频地址: {audio_url}")
-                            print(f"  -> 名称: {audio_name}")
-                            audio_results.append({
-                                "title": ch["title"],
-                                "audio_name": audio_name,
-                                "audio_url": audio_url,
-                                "play_page": ch["url"]
-                            })
+                        data = await resp.json()
+                        if data.get("status") == 200 and not captured:
+                            captured["name"] = data.get("name")
+                            captured["url"] = data.get("url")
                     except:
                         pass
 
-            page.on("response", handle_response)
+            play_page.on("response", on_response)
+
             try:
-                await page.goto(ch["url"], wait_until="domcontentloaded", timeout=30000)
-                # 等待页面触发播放请求 (有些页面需要点击播放按钮)
-                # 可以等待某个元素出现，比如播放按钮，或直接等待几秒
-                # 这里简单等待 3 秒，确保 JS 执行完毕并发起请求
+                await play_page.goto(ch["url"], wait_until="domcontentloaded", timeout=30000)
+                # 等待 JS 执行并触发 API 请求
                 await asyncio.sleep(3)
-                # 尝试点击播放按钮（如果页面有）
-                play_btn = await page.query_selector(".play-btn, #playButton, .audio-play")
-                if play_btn:
-                    await play_btn.click()
+                # 如果页面有显式播放按钮，尝试点击
+                btn = await play_page.query_selector(".play-btn, #playButton, .audio-play")
+                if btn:
+                    await btn.click()
                     await asyncio.sleep(2)
+                await asyncio.sleep(2)  # 额外等待确保请求完成
             except Exception as e:
-                print(f"  ⚠️ 页面加载异常: {e}")
-            finally:
-                page.remove_listener("response", handle_response)
+                print(f"⚠️ 播放页异常: {e}")
+
+            play_page.remove_listener("response", on_response)
+
+            if captured.get("url"):
+                print(f"🎵 音频名称: {captured['name']}")
+                print(f"🔗 音频地址: {captured['url']}")
+                audio_data.append({
+                    "title": ch["title"],
+                    "audio_name": captured["name"],
+                    "audio_url": captured["url"]
+                })
+            else:
+                print("⚠️ 未捕获到音频地址")
+
+            await play_page.close()
 
         await browser.close()
-        return audio_results
 
-def main():
-    cookies = get_cookies_from_env()
-    chapters = fetch_directory(cookies)
-    if not chapters:
-        print("未找到任何章节")
-        return
-
-    # 只爬前 3 章作为测试，避免过大压力
-    max_chapters = 3
-    print(f"\n开始提取前 {max_chapters} 章的音频地址...")
-    audio_data = asyncio.run(get_audio_urls(chapters, cookies, max_chapters))
-
-    print("\n" + "=" * 60)
-    print("抓取结果：")
-    for item in audio_data:
-        print(f"标题: {item['title']}")
-        print(f"音频名称: {item['audio_name']}")
-        print(f"音频URL: {item['audio_url']}")
-        print("-" * 40)
-
-    # 可选：将结果保存为 JSON
-    with open("audio_results.json", "w", encoding="utf-8") as f:
-        json.dump(audio_data, f, ensure_ascii=False, indent=2)
-    print("结果已保存到 audio_results.json")
+        # ---------- 3. 输出与保存 ----------
+        print("\n" + "=" * 60)
+        for item in audio_data:
+            print(f"✔ {item['title']}")
+            print(f"  {item['audio_url']}")
+        with open("audio_results.json", "w", encoding="utf-8") as f:
+            json.dump(audio_data, f, ensure_ascii=False, indent=2)
+        print("\n结果已保存至 audio_results.json")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
