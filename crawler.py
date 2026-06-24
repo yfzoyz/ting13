@@ -5,6 +5,7 @@ import asyncio
 import time
 import requests
 import subprocess
+from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
 # ===== 配置 =====
@@ -12,7 +13,6 @@ BASE_URL = "https://www.ting13.cc"
 BOOK_KEY = os.environ.get("BOOK_KEY", "赘婿")
 BOOK_URLS = {
     "赘婿": f"{BASE_URL}/tingdirs/uiPlHh/cbbhASacUDuaQoFc.html",
-    # 未来可添加其他小说
 }
 BASE_DIR_URL = BOOK_URLS.get(BOOK_KEY)
 if not BASE_DIR_URL:
@@ -25,6 +25,17 @@ ACCESS_TOKEN = os.environ["ACCESS_TOKEN"]
 TARGET_DIR = f"public/{BOOK_KEY}"
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 QQBrowser/21.1.8663.400"
+
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Ch-Ua": '"Chromium";v="123", "Not:A-Brand";v="8"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Referer": BASE_URL,
+}
 
 # ===== 工具函数 =====
 def get_cookies():
@@ -54,79 +65,82 @@ def sanitize_filename(title):
         name = name[:80]
     return name.strip()
 
-async def get_total_pages(page):
-    """从首页解析总页数"""
-    page_list = await page.query_selector_all(".chapter-list-block li a")
+def fetch_chapters_with_requests(cookies):
+    """使用 requests + BeautifulSoup 抓取所有分页的章节链接"""
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    session.cookies.update(cookies)
+
+    all_chapters = []
+
+    # 首先获取第一页，并解析总页数
+    print(f"正在获取首页: {BASE_DIR_URL}?page=1&sort=asc")
+    try:
+        resp = session.get(f"{BASE_DIR_URL}?page=1&sort=asc", timeout=15)
+        resp.encoding = 'utf-8'
+        if resp.status_code != 200:
+            raise RuntimeError(f"首页状态码 {resp.status_code}")
+    except Exception as e:
+        raise RuntimeError(f"请求首页失败: {e}")
+
+    soup = BeautifulSoup(resp.text, 'html.parser')
+
+    # 提取总页数
+    page_links = soup.select(".chapter-list-block li a")
     max_page = 1
-    for item in page_list:
-        href = await item.get_attribute("href")
-        if href:
-            match = re.search(r"page=(\d+)", href)
-            if match:
-                p = int(match.group(1))
-                if p > max_page:
-                    max_page = p
-    return max_page
+    for a in page_links:
+        href = a.get("href", "")
+        match = re.search(r"page=(\d+)", href)
+        if match:
+            p = int(match.group(1))
+            if p > max_page:
+                max_page = p
+    print(f"📖 共检测到 {max_page} 页")
 
-async def fetch_all_chapters(cookies):
-    """遍历所有分页，获取完整章节列表"""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-http2", "--disable-gpu"]
-        )
-        context = await browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1280, "height": 720},
-            locale="zh-CN"
-        )
-        await context.add_cookies([
-            {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
-            for k, v in cookies.items()
-        ])
+    # 解析第一页的章节
+    playlist = soup.find("div", id="playlist")
+    if playlist:
+        for li in playlist.find_all("li"):
+            a = li.find("a")
+            if a and a.get("href"):
+                all_chapters.append({
+                    "title": a.get("title", "").strip(),
+                    "url": BASE_URL + a["href"]
+                })
+    print(f"  第1页获取 {len(all_chapters)} 集")
 
-        # 先打开首页，获取总页数
-        page = await context.new_page()
-        print(f"正在获取首页: {BASE_DIR_URL}?page=1&sort=asc")
-        await page.goto(f"{BASE_DIR_URL}?page=1&sort=asc", wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(3)
-        total_pages = await get_total_pages(page)
-        print(f"📖 共检测到 {total_pages} 页")
-        await page.close()
+    # 获取剩余页面
+    for pg in range(2, max_page + 1):
+        print(f"  抓取第 {pg}/{max_page} 页...", end=" ")
+        try:
+            resp = session.get(f"{BASE_DIR_URL}?page={pg}&sort=asc", timeout=15)
+            resp.encoding = 'utf-8'
+            if resp.status_code != 200:
+                print(f"状态码 {resp.status_code}，跳过")
+                continue
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            playlist = soup.find("div", id="playlist")
+            if not playlist:
+                print("未找到播放列表，跳过")
+                continue
+            count = 0
+            for li in playlist.find_all("li"):
+                a = li.find("a")
+                if a and a.get("href"):
+                    all_chapters.append({
+                        "title": a.get("title", "").strip(),
+                        "url": BASE_URL + a["href"]
+                    })
+                    count += 1
+            print(f"获取 {count} 集")
+        except Exception as e:
+            print(f"失败 ({e})，跳过")
+        time.sleep(1)  # 礼貌延时
 
-        all_chapters = []
-        for pg in range(1, total_pages + 1):
-            print(f"  抓取第 {pg}/{total_pages} 页...", end=" ")
-            page = await context.new_page()
-            try:
-                await page.goto(
-                    f"{BASE_DIR_URL}?page={pg}&sort=asc",
-                    wait_until="domcontentloaded",
-                    timeout=30000
-                )
-                await asyncio.sleep(2)
-                chs = await page.evaluate('''() => {
-                    const ul = document.querySelector("#playlist ul");
-                    if (!ul) return [];
-                    const lis = ul.querySelectorAll("li a");
-                    return Array.from(lis).map(a => ({
-                        title: a.getAttribute("title") || a.innerText.trim(),
-                        url: a.href
-                    }));
-                }''')
-                all_chapters.extend(chs)
-                print(f"获取 {len(chs)} 集")
-            except Exception as e:
-                print(f"失败 ({e})，跳过")
-            finally:
-                await page.close()
-            time.sleep(1)  # 礼貌延时
-
-        await browser.close()
-        return all_chapters
+    return all_chapters
 
 async def fetch_audio_url(play_url, cookies):
-    """打开播放页，拦截音频 API"""
+    """Playwright 打开播放页，拦截音频 API"""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-http2", "--disable-gpu"])
         context = await browser.new_context(user_agent=USER_AGENT)
@@ -151,7 +165,6 @@ async def fetch_audio_url(play_url, cookies):
         try:
             await page.goto(play_url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(3)
-            # 尝试点击播放按钮
             await page.evaluate("() => { const btn = document.querySelector('.play-btn,#playButton,.audio-play'); if(btn) btn.click(); }")
             await asyncio.sleep(3)
         except Exception as e:
@@ -226,8 +239,8 @@ async def main():
     start_index = book_progress["last_index"] + 1
     print(f"📖 当前进度：{BOOK_KEY} 已爬取 {book_progress['last_index']} 集，从第 {start_index} 集开始")
 
-    # 2. 获取完整章节列表
-    chapters = await fetch_all_chapters(cookies)
+    # 2. 获取完整章节列表（使用 requests，更稳定）
+    chapters = fetch_chapters_with_requests(cookies)
     total_chapters = len(chapters)
     print(f"📚 共获取到 {total_chapters} 个章节")
     if total_chapters == 0:
