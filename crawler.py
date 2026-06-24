@@ -35,59 +35,69 @@ async def login(playwright):
     page = await context.new_page()
 
     print("🔐 正在打开登录页面...")
-    # 使用 domcontentloaded 避免 networkidle 超时
     await page.goto(f"{BASE_URL}/user/public/login.html", wait_until="domcontentloaded", timeout=60000)
-    # 等待滑块元素可见（确保 JS 加载）
     await page.wait_for_selector("#slider", state="visible", timeout=15000)
     await asyncio.sleep(2)
 
     await page.fill('input[name="username"]', username)
     await page.fill('input[name="password"]', password)
 
-    # 滑块验证
+    # 滑块验证：先尝试拖拽，失败则 JS 强制通过
     slider = page.locator("#slider")
     container = page.locator(".slider-container")
-    print("  正在拖动滑块...")
-    # 使用 Playwright 内置的 drag_to，精确到容器右边缘
-    await slider.drag_to(container, target_position={"x": container.bounding_box()['width'] - slider.bounding_box()['width'], "y": 0}, force=True)
-    await asyncio.sleep(1)
+    success = False
+    for attempt in range(3):
+        print(f"  尝试拖拽 (第{attempt+1}次)...")
+        slider_box = await slider.bounding_box()
+        cont_box = await container.bounding_box()
+        if not slider_box or not cont_box:
+            continue
+        start_x = slider_box['x'] + slider_box['width'] / 2
+        start_y = slider_box['y'] + slider_box['height'] / 2
+        end_x = cont_box['x'] + cont_box['width'] - slider_box['width'] / 2
+        await page.mouse.move(start_x, start_y)
+        await page.mouse.down()
+        steps = 40
+        for i in range(1, steps + 1):
+            x = start_x + (end_x - start_x) * i / steps
+            await page.mouse.move(x, start_y)
+            await asyncio.sleep(0.02)
+        await page.mouse.up()
+        await asyncio.sleep(1)
+        text = await page.text_content("#sliderText")
+        print(f"  滑块状态: {text}")
+        if "验证通过" in text:
+            success = True
+            break
 
-    text = await page.text_content("#sliderText")
-    print(f"  滑块状态: {text}")
-    if "验证通过" not in text:
-        # 若失败，尝试手动设置位置并触发事件
-        print("  拖拽未触发，尝试 JS 强制验证...")
+    if not success:
+        print("  拖拽失败，使用 JS 强制验证并提交表单...")
         await page.evaluate('''() => {
             const slider = document.getElementById('slider');
             const container = slider.parentElement;
             slider.style.left = (container.offsetWidth - slider.offsetWidth) + 'px';
-            slider.dispatchEvent(new Event('input', { bubbles: true }));
-            slider.dispatchEvent(new Event('mouseup', { bubbles: true }));
+            const token = Math.random().toString(36).substring(2, 18);
+            document.getElementById('verificationToken').value = token;
             document.getElementById('sliderText').innerText = '验证通过';
-            // 自动提交
-            setTimeout(() => { document.getElementById('loginButton').click(); }, 500);
+            const btn = document.getElementById('loginButton');
+            btn.disabled = false;
+            document.getElementById('frmpassedit').submit();
         }''')
         await asyncio.sleep(2)
         text = await page.text_content("#sliderText")
         print(f"  JS 后状态: {text}")
 
-    if "验证通过" not in await page.text_content("#sliderText"):
-        raise RuntimeError("滑块验证失败，无法继续登录")
-
-    # 等待页面跳转（表单可能自动提交）
+    # 等待跳转到用户中心（自动提交或手动）
     print("  等待登录跳转...")
     try:
         await page.wait_for_url("**/user/index/index.html", timeout=30000)
     except:
-        # 手动点击登录按钮
-        btn = page.locator("#loginButton")
-        if await btn.is_enabled():
-            await btn.click()
-            await page.wait_for_url("**/user/index/index.html", timeout=15000)
-        else:
-            raise RuntimeError("登录按钮仍不可用")
-    print("✅ 登录成功")
+        # 如果超时，再次强制提交表单
+        print("  跳转超时，再次尝试提交...")
+        await page.evaluate("document.getElementById('frmpassedit').submit()")
+        await page.wait_for_url("**/user/index/index.html", timeout=15000)
 
+    print("✅ 登录成功")
     cookies = await context.cookies()
     await browser.close()
     return {c['name']: c['value'] for c in cookies}
