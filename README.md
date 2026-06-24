@@ -24,7 +24,7 @@
 
 ## Secrets 配置示例（GitHub 仓库 Settings → Secrets and variables → Actions）
 
-1. 新建 `TING13_COOKIES`，粘贴完整的 Cookie 字符串。  
+1. 新建 `TING13`，格式：账号-----密码。  
 2. 新建 `PRIVATE_REPO`，填入私有仓库全名（如 `myuser/my-private-storage`）。  
 3. 新建 `ACCESS_TOKEN`，填入生成的 Personal Access Token。  
 4. 新建 `GH_TOKEN`，可使用同一个 Token。  
