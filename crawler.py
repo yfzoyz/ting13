@@ -2,7 +2,6 @@ import os, re, json, asyncio, time, subprocess, requests
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 
-# ===== 配置 =====
 BASE_URL = "https://www.ting13.cc"
 BOOK_KEY = os.environ.get("BOOK_KEY", "赘婿")
 BOOK_URLS = {"赘婿": f"{BASE_URL}/tingdirs/uiPlHh/cbbhASacUDuaQoFc.html"}
@@ -25,10 +24,10 @@ def sanitize_filename(title):
     name = re.sub(r'[\\/*?:"<>|]', "", title)
     return name[:80].strip()
 
-# ===== Playwright 登录 =====
+# ===== 登录 (Playwright) =====
 async def login(playwright):
     raw = os.environ.get("TING13", "")
-    if "-----" not in raw: raise RuntimeError("TING13 格式错误，应为 账号-----密码")
+    if "-----" not in raw: raise RuntimeError("TING13 格式错误")
     username, password = raw.split("-----", 1)
 
     browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-http2", "--disable-gpu"])
@@ -36,7 +35,10 @@ async def login(playwright):
     page = await context.new_page()
 
     print("🔐 正在打开登录页面...")
-    await page.goto(f"{BASE_URL}/user/public/login.html", wait_until="networkidle")
+    # 使用 domcontentloaded 避免 networkidle 超时
+    await page.goto(f"{BASE_URL}/user/public/login.html", wait_until="domcontentloaded", timeout=60000)
+    # 等待滑块元素可见（确保 JS 加载）
+    await page.wait_for_selector("#slider", state="visible", timeout=15000)
     await asyncio.sleep(2)
 
     await page.fill('input[name="username"]', username)
@@ -45,79 +47,52 @@ async def login(playwright):
     # 滑块验证
     slider = page.locator("#slider")
     container = page.locator(".slider-container")
-    await slider.wait_for(state="visible")
+    print("  正在拖动滑块...")
+    # 使用 Playwright 内置的 drag_to，精确到容器右边缘
+    await slider.drag_to(container, target_position={"x": container.bounding_box()['width'] - slider.bounding_box()['width'], "y": 0}, force=True)
+    await asyncio.sleep(1)
 
-    # 多次尝试拖拽，直到显示“验证通过”
-    for attempt in range(3):
-        slider_box = await slider.bounding_box()
-        cont_box = await container.bounding_box()
-        if not slider_box or not cont_box:
-            raise RuntimeError("未找到滑块元素")
-
-        start_x = slider_box['x'] + slider_box['width'] / 2
-        start_y = slider_box['y'] + slider_box['height'] / 2
-        end_x = cont_box['x'] + cont_box['width'] - slider_box['width'] / 2
-
-        print(f"  尝试拖拽 (第{attempt+1}次)...")
-        await page.mouse.move(start_x, start_y)
-        await page.mouse.down()
-        # 小步移动，模拟真人
-        steps = 40
-        for i in range(1, steps + 1):
-            x = start_x + (end_x - start_x) * i / steps
-            await page.mouse.move(x, start_y)
-            await asyncio.sleep(0.02)  # 20ms 每步
-        await page.mouse.up()
-        await asyncio.sleep(1)
-
-        text = await page.text_content("#sliderText")
-        print(f"  滑块状态: {text}")
-        if "验证通过" in text:
-            break
-    else:
-        # 如果三次都失败，尝试用 JS 强制触发
-        print("  常规拖拽失败，尝试 JS 强制验证...")
+    text = await page.text_content("#sliderText")
+    print(f"  滑块状态: {text}")
+    if "验证通过" not in text:
+        # 若失败，尝试手动设置位置并触发事件
+        print("  拖拽未触发，尝试 JS 强制验证...")
         await page.evaluate('''() => {
             const slider = document.getElementById('slider');
             const container = slider.parentElement;
             slider.style.left = (container.offsetWidth - slider.offsetWidth) + 'px';
-            const evt = new Event('input', { bubbles: true });
-            slider.dispatchEvent(evt);
-            // 模拟 touchend / mouseup
-            ['touchend', 'mouseup'].forEach(type => {
-                const e = new Event(type, { bubbles: true });
-                slider.dispatchEvent(e);
-            });
-            // 更新文本
-            const text = document.getElementById('sliderText');
-            if (text) text.innerText = '验证通过';
+            slider.dispatchEvent(new Event('input', { bubbles: true }));
+            slider.dispatchEvent(new Event('mouseup', { bubbles: true }));
+            document.getElementById('sliderText').innerText = '验证通过';
+            // 自动提交
+            setTimeout(() => { document.getElementById('loginButton').click(); }, 500);
         }''')
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
         text = await page.text_content("#sliderText")
         print(f"  JS 后状态: {text}")
 
     if "验证通过" not in await page.text_content("#sliderText"):
         raise RuntimeError("滑块验证失败，无法继续登录")
 
-    # 验证通过后，页面通常会自动提交，等待跳转
+    # 等待页面跳转（表单可能自动提交）
     print("  等待登录跳转...")
     try:
         await page.wait_for_url("**/user/index/index.html", timeout=30000)
     except:
-        print("  未自动跳转，尝试手动点击登录按钮...")
+        # 手动点击登录按钮
         btn = page.locator("#loginButton")
         if await btn.is_enabled():
             await btn.click()
             await page.wait_for_url("**/user/index/index.html", timeout=15000)
         else:
-            raise RuntimeError("登录失败，按钮仍不可用")
+            raise RuntimeError("登录按钮仍不可用")
     print("✅ 登录成功")
 
     cookies = await context.cookies()
     await browser.close()
     return {c['name']: c['value'] for c in cookies}
 
-# ===== 获取目录 =====
+# ===== 目录抓取 =====
 async def fetch_chapters(playwright, cookies_dict):
     req_ctx = await playwright.request.new_context(user_agent=USER_AGENT)
     await req_ctx.add_cookies([{"name": k, "value": v, "domain": ".ting13.cc", "path": "/"} for k, v in cookies_dict.items()])
@@ -153,7 +128,7 @@ async def fetch_chapters(playwright, cookies_dict):
     await req_ctx.dispose()
     return chapters
 
-# ===== 获取音频地址 =====
+# ===== 音频地址 =====
 async def fetch_audio_url(playwright, play_url, cookies_dict):
     browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-http2", "--disable-gpu"])
     context = await browser.new_context(user_agent=USER_AGENT)
@@ -184,7 +159,6 @@ async def fetch_audio_url(playwright, play_url, cookies_dict):
         await browser.close()
     return captured.get("name", ""), captured.get("url", "")
 
-# ===== 下载音频 =====
 def download_audio(url, filepath):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     resp = requests.get(url, headers={"User-Agent": USER_AGENT}, stream=True, timeout=120)
@@ -193,7 +167,6 @@ def download_audio(url, filepath):
         for chunk in resp.iter_content(8192): f.write(chunk)
     return True
 
-# ===== Git 操作 =====
 def clone_private_repo():
     subprocess.run(["rm", "-rf", "/tmp/private_repo"], check=False)
     subprocess.run(["git", "clone", "--depth", "1", f"https://{ACCESS_TOKEN}@github.com/{PRIVATE_REPO}.git", "/tmp/private_repo"], check=True)
@@ -230,7 +203,6 @@ def update_index_json(repo_path, entries):
         json.dump(existing, f, ensure_ascii=False, indent=2)
     print(f"📄 index.json 更新至 {len(existing)} 集")
 
-# ===== 主流程 =====
 async def main():
     progress = load_progress()
     bp = progress.get(BOOK_KEY, {"last_index": 0, "total_chapters": 0})
@@ -246,28 +218,24 @@ async def main():
         bp["total_chapters"] = total
         end = min(start + MAX_PER_RUN - 1, total)
         if start > total:
-            print("✅ 已全部爬完")
-            return
+            print("✅ 已全部爬完"); return
         print(f"⚡ 本次: 第{start}-{end}集")
 
         repo = clone_private_repo()
         entries = []
         for i in range(start-1, end):
-            ch = chapters[i]
-            ep = i+1
+            ch = chapters[i]; ep = i+1
             print(f"\n🎯 第{ep}集: {ch['title']}")
             name, url = await fetch_audio_url(p, ch["url"], cookies)
             if not url:
-                print("   ⚠️ 未获取到音频链接")
-                continue
+                print("   ⚠️ 未获取到音频链接"); continue
             fname = sanitize_filename(name or ch['title']) + ".m4a"
             dest = os.path.join(repo, TARGET_DIR, fname)
             try:
                 download_audio(url, dest)
                 print(f"   ✅ 下载成功: {fname}")
             except Exception as e:
-                print(f"   ❌ 下载失败: {e}")
-                continue
+                print(f"   ❌ 下载失败: {e}"); continue
             entries.append({"name": fname[:-4], "title": name or ch['title'], "episode": ep, "url": f"{BOOK_KEY}/{fname}"})
             await asyncio.sleep(1)
 
