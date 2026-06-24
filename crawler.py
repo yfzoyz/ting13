@@ -1,10 +1,10 @@
 import os, re, json, asyncio, time, subprocess, requests
 from playwright.async_api import async_playwright
-from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.ting13.cc"
 BOOK_KEY = os.environ.get("BOOK_KEY", "赘婿")
-BOOK_URLS = {"赘婿": f"{BASE_URL}/tingdirs/uiPlHh/cbbhASacUDuaQoFc.html"}
+# 修正后的目录页 URL
+BOOK_URLS = {"赘婿": f"{BASE_URL}/tingdirs/uiPlHh/cbbhASacUDucKtDb.html"}
 BASE_DIR_URL = BOOK_URLS[BOOK_KEY]
 MAX_PER_RUN = 50
 PROGRESS_FILE = "progress.json"
@@ -30,14 +30,8 @@ async def login(playwright):
     if "-----" not in raw: raise RuntimeError("TING13 格式错误")
     username, password = raw.split("-----", 1)
 
-    browser = await playwright.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-http2", "--disable-gpu"]
-    )
-    context = await browser.new_context(
-        user_agent=USER_AGENT,
-        viewport={"width": 1280, "height": 720}
-    )
+    browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-http2", "--disable-gpu"])
+    context = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 720})
     page = await context.new_page()
 
     print("🔐 正在打开登录页面...")
@@ -62,7 +56,6 @@ async def login(playwright):
         window._loginToken = token;
     }''')
     token = await page.evaluate("() => window._loginToken")
-
     await page.evaluate('''async (token) => {
         await fetch('/user/public/store_token.html', {
             method: 'POST',
@@ -78,15 +71,14 @@ async def login(playwright):
 
     cookies = await context.cookies()
     cookie_dict = {c['name']: c['value'] for c in cookies}
+    await page.close()
+    await context.close()
     return browser, cookie_dict
 
-# ===== 目录抓取 =====
+# ===== 目录抓取（已修复） =====
 async def fetch_chapters(browser, cookies_dict):
     context = await browser.new_context(user_agent=USER_AGENT)
-    await context.add_cookies([
-        {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
-        for k, v in cookies_dict.items()
-    ])
+    await context.add_cookies([{"name": k, "value": v, "domain": ".ting13.cc", "path": "/"} for k, v in cookies_dict.items()])
     page = await context.new_page()
     chapters = []
 
@@ -94,11 +86,11 @@ async def fetch_chapters(browser, cookies_dict):
     await page.goto(f"{BASE_DIR_URL}?page=1&sort=asc", wait_until="domcontentloaded", timeout=30000)
     await page.wait_for_selector("#playlist", timeout=15000)
 
-    # 使用 evaluate 提取最大页码
+    # 提取最大页码（从快速选集区块）
     max_page = await page.evaluate('''() => {
-        const links = document.querySelectorAll('a[href*="page="]');
+        const items = document.querySelectorAll('.chapter-list-block a[href*="page="]');
         let max = 1;
-        links.forEach(a => {
+        items.forEach(a => {
             const m = a.href.match(/page=(\d+)/);
             if (m) {
                 const num = parseInt(m[1], 10);
@@ -109,6 +101,7 @@ async def fetch_chapters(browser, cookies_dict):
     }''')
     print(f"📖 共 {max_page} 页")
 
+    # 解析当前页章节
     async def parse_current_page():
         items = await page.query_selector_all("#playlist ul li a")
         chs = []
@@ -119,20 +112,20 @@ async def fetch_chapters(browser, cookies_dict):
                 chs.append({"title": title.strip(), "url": BASE_URL + url})
         return chs
 
+    # 抓取第一页
     chs = await parse_current_page()
     chapters.extend(chs)
     first_title = chs[0]['title'] if chs else '无'
     print(f"  第1页获取 {len(chs)} 集，首个标题: {first_title}")
 
-    # 如果首个标题不是第1集，则可能是降序，强制重新请求正序
-    if "第1集" not in first_title and "赘婿第一章" not in first_title:
-        print("  ⚠️ 发现排序可能为降序，重新请求正序...")
-        await page.goto(f"{BASE_DIR_URL}?page=1&sort=asc", wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_selector("#playlist", timeout=15000)
-        chs = await parse_current_page()
-        chapters = chs
-        print(f"  重新获取第1页: {len(chs)} 集，首个: {chs[0]['title'] if chs else '无'}")
+    # 检测是否为降序（首个章节包含的数字大于100）
+    is_descending = False
+    nums = re.findall(r'\d+', first_title)
+    if nums and int(nums[0]) > 100:
+        is_descending = True
+        print("  ⚠️ 检测到为降序排列，将在最后反转列表。")
 
+    # 抓取剩余页面
     for pg in range(2, max_page + 1):
         print(f"  抓取第 {pg}/{max_page} 页...", end=" ")
         try:
@@ -147,15 +140,18 @@ async def fetch_chapters(browser, cookies_dict):
 
     await page.close()
     await context.close()
+
+    # 如果检测为降序，则反转整个列表使其变为正序（第1集在前）
+    if is_descending:
+        chapters.reverse()
+        print("  列表已反转为正序（第1集 -> 最后一集）")
+
     return chapters
 
 # ===== 获取音频地址 =====
 async def fetch_audio_url(browser, play_url, cookies_dict):
     context = await browser.new_context(user_agent=USER_AGENT)
-    await context.add_cookies([
-        {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
-        for k, v in cookies_dict.items()
-    ])
+    await context.add_cookies([{"name": k, "value": v, "domain": ".ting13.cc", "path": "/"} for k, v in cookies_dict.items()])
     page = await context.new_page()
     captured = {}
 
