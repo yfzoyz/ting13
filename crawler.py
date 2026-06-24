@@ -24,7 +24,7 @@ def sanitize_filename(title):
     name = re.sub(r'[\\/*?:"<>|]', "", title)
     return name[:80].strip()
 
-# ===== 登录 (Playwright) =====
+# ===== 登录 =====
 async def login(playwright):
     raw = os.environ.get("TING13", "")
     if "-----" not in raw:
@@ -32,13 +32,9 @@ async def login(playwright):
     username, password = raw.split("-----", 1)
 
     browser = await playwright.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-http2", "--disable-gpu"]
+        headless=True, args=["--no-sandbox", "--disable-http2", "--disable-gpu"]
     )
-    context = await browser.new_context(
-        user_agent=USER_AGENT,
-        viewport={"width": 1280, "height": 720}
-    )
+    context = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 720})
     page = await context.new_page()
 
     print("🔐 正在打开登录页面...")
@@ -51,8 +47,6 @@ async def login(playwright):
     await asyncio.sleep(0.5)
 
     print("  使用 JS 完整模拟登录流程...")
-
-    # 设置验证状态（不触发 submit）
     await page.evaluate('''() => {
         const slider = document.getElementById('slider');
         const container = slider.parentElement;
@@ -60,9 +54,7 @@ async def login(playwright):
         document.getElementById('sliderText').innerText = '验证通过';
         const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
         let token = '';
-        for (let i = 0; i < 16; i++) {
-            token += chars.charAt(Math.floor(Math.random() * chars.length));
-        }
+        for (let i = 0; i < 16; i++) token += chars.charAt(Math.floor(Math.random() * chars.length));
         document.getElementById('verificationToken').value = token;
         document.getElementById('loginButton').disabled = false;
         window._loginToken = token;
@@ -81,12 +73,9 @@ async def login(playwright):
                 body: JSON.stringify({token: token})
             });
             return {status: resp.status, ok: resp.ok};
-        } catch(e) {
-            return {error: e.toString()};
-        }
+        } catch(e) { return {error: e.toString()}; }
     }''', token)
     print(f"  store_token 响应: {store_resp}")
-
     await asyncio.sleep(0.5)
 
     print("  提交登录表单，等待跳转...")
@@ -99,10 +88,8 @@ async def login(playwright):
             await page.evaluate("() => document.getElementById('frmpassedit').submit()")
         print("✅ 登录成功（form submit）")
     except Exception as e:
-        print(f"  form submit 等待超时: {e}")
-        current_url = page.url
-        print(f"  当前页面: {current_url}")
-        if "user/index" not in current_url:
+        print(f"  form submit 超时: {e}")
+        if "user/index" not in page.url:
             try:
                 async with page.expect_navigation(
                     url="**/user/index/index.html",
@@ -112,8 +99,8 @@ async def login(playwright):
                     await page.click("#loginButton")
             except Exception as e2:
                 print(f"  点击按钮也失败: {e2}")
-                cookies = await context.cookies()
-                if "PTCMS_userid" not in [c['name'] for c in cookies]:
+                cookies_check = await context.cookies()
+                if "PTCMS_userid" not in [c['name'] for c in cookies_check]:
                     await browser.close()
                     raise RuntimeError(f"登录失败，当前页面: {page.url}")
 
@@ -128,48 +115,69 @@ async def login(playwright):
     return cookie_dict
 
 
-# ===== 目录抓取：改用 requests 库携带 cookies =====
+# ===== 目录抓取：用 requests，修正选择器 =====
 def fetch_chapters_sync(cookies_dict):
-    """用同步 requests 抓取目录，避免 Playwright APIRequestContext 的 cookie 问题"""
     session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-    # 设置 cookies
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    })
     for name, value in cookies_dict.items():
         session.cookies.set(name, value, domain="www.ting13.cc")
 
-    def parse_page(html):
+    def parse_chapters(html):
+        """解析 #playlist ul li a，获取章节链接"""
         s = BeautifulSoup(html, 'html.parser')
-        div = s.find("div", id="playlist")
-        if not div:
+        playlist_div = s.find("div", id="playlist")
+        if not playlist_div:
+            print("  ⚠️ 未找到 #playlist div")
             return []
-        return [
-            {"title": a.get("title", "").strip(), "url": BASE_URL + a["href"]}
-            for li in div.find_all("li")
-            if (a := li.find("a")) and a.get("href")
-        ]
+        results = []
+        for li in playlist_div.find_all("li"):
+            a = li.find("a")
+            if not a or not a.get("href"):
+                continue
+            href = a["href"].strip()
+            if not href.startswith("/play/"):
+                continue
+            title = a.get("title", "").strip() or a.get_text(strip=True)
+            results.append({"title": title, "url": BASE_URL + href})
+        return results
 
-    chapters = []
-    max_page = 1
+    def get_max_page(html):
+        """从 .js_chapter_ul 里解析最大页码"""
+        s = BeautifulSoup(html, 'html.parser')
+        max_page = 1
+        # 找分页导航：.chapter-list-block 或 .js_chapter_ul
+        ul = s.find("ul", class_="js_chapter_ul")
+        if ul:
+            for a in ul.find_all("a", href=True):
+                m = re.search(r"page=(\d+)", a["href"])
+                if m:
+                    max_page = max(max_page, int(m.group(1)))
+        return max_page
 
-    # 第一页，探测总页数
-    resp = session.get(f"{BASE_DIR_URL}?page=1&sort=asc", timeout=30)
+    # 第一页
+    url1 = f"{BASE_DIR_URL}?page=1&sort=asc"
+    print(f"  请求: {url1}")
+    resp = session.get(url1, timeout=30)
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, 'html.parser')
+    resp.encoding = 'utf-8'
 
-    # 检测分页
-    for a in soup.select("a[href]"):
-        if m := re.search(r"page=(\d+)", a.get("href", "")):
-            max_page = max(max_page, int(m.group(1)))
-
+    max_page = get_max_page(resp.text)
     print(f"📖 共 {max_page} 页")
-    chapters += parse_page(resp.text)
+
+    chapters = parse_chapters(resp.text)
     print(f"  第1页: {len(chapters)} 集")
 
     for pg in range(2, max_page + 1):
         try:
-            resp = session.get(f"{BASE_DIR_URL}?page={pg}&sort=asc", timeout=30)
+            url_pg = f"{BASE_DIR_URL}?page={pg}&sort=asc"
+            resp = session.get(url_pg, timeout=30)
             resp.raise_for_status()
-            chs = parse_page(resp.text)
+            resp.encoding = 'utf-8'
+            chs = parse_chapters(resp.text)
             chapters += chs
             print(f"  第{pg}页: {len(chs)} 集")
             time.sleep(1)
@@ -179,11 +187,10 @@ def fetch_chapters_sync(cookies_dict):
     return chapters
 
 
-# ===== 音频地址 =====
+# ===== 音频地址：监听 /api/mapi/play 响应 =====
 async def fetch_audio_url(playwright, play_url, cookies_dict):
     browser = await playwright.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-http2", "--disable-gpu"]
+        headless=True, args=["--no-sandbox", "--disable-http2", "--disable-gpu"]
     )
     context = await browser.new_context(user_agent=USER_AGENT)
     await context.add_cookies([
@@ -198,35 +205,34 @@ async def fetch_audio_url(playwright, play_url, cookies_dict):
             try:
                 data = await resp.json()
                 if data.get("status") == 200:
-                    captured["name"] = data.get("name")
-                    captured["url"] = data.get("url")
+                    captured["name"] = data.get("name", "")
+                    captured["url"] = data.get("url", "")
+                    print(f"    🎵 捕获: {captured['name']}")
             except:
                 pass
 
     page.on("response", on_response)
     try:
         await page.goto(play_url, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(3)
-        await page.evaluate(
-            "() => { const btn = document.querySelector('.play-btn,#playButton,.audio-play'); if(btn) btn.click(); }"
-        )
-        await asyncio.sleep(3)
+        # 等待 API 响应，最多等 10 秒
+        for _ in range(20):
+            if captured:
+                break
+            await asyncio.sleep(0.5)
     except Exception as e:
         print(f"    播放页异常: {e}")
     finally:
         page.remove_listener("response", on_response)
         await page.close()
         await browser.close()
+
     return captured.get("name", ""), captured.get("url", "")
 
 
 def download_audio(url, filepath):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     resp = requests.get(
-        url,
-        headers={"User-Agent": USER_AGENT},
-        stream=True,
-        timeout=120
+        url, headers={"User-Agent": USER_AGENT}, stream=True, timeout=120
     )
     resp.raise_for_status()
     with open(filepath, "wb") as f:
@@ -250,8 +256,7 @@ def commit_and_push(repo_path, msg):
     subprocess.run(["git", "-C", repo_path, "config", "user.name", "GitHub Actions"], check=True)
     subprocess.run(["git", "-C", repo_path, "add", "."], check=True)
     status = subprocess.run(
-        ["git", "-C", repo_path, "status", "--porcelain"],
-        capture_output=True, text=True
+        ["git", "-C", repo_path, "status", "--porcelain"], capture_output=True, text=True
     ).stdout
     if status.strip():
         subprocess.run(["git", "-C", repo_path, "commit", "-m", msg], check=True)
@@ -268,10 +273,8 @@ def update_index_json(repo_path, entries):
     existing = []
     if os.path.exists(idx_path):
         with open(idx_path, "r", encoding="utf-8") as f:
-            try:
-                existing = json.load(f)
-            except:
-                pass
+            try: existing = json.load(f)
+            except: pass
     eps = {e["episode"] for e in existing}
     for e in entries:
         if e["episode"] not in eps:
@@ -292,7 +295,6 @@ async def main():
     async with async_playwright() as p:
         cookies = await login(p)
 
-        # 目录抓取改用同步 requests（在线程池中运行避免阻塞事件循环）
         loop = asyncio.get_event_loop()
         chapters = await loop.run_in_executor(None, fetch_chapters_sync, cookies)
 
@@ -300,6 +302,7 @@ async def main():
         print(f"📚 共获取 {total} 章节")
         if not total:
             return
+
         bp["total_chapters"] = total
         end = min(start + MAX_PER_RUN - 1, total)
         if start > total:
@@ -309,6 +312,7 @@ async def main():
 
         repo = clone_private_repo()
         entries = []
+
         for i in range(start - 1, end):
             ch = chapters[i]
             ep = i + 1
