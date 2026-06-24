@@ -5,25 +5,24 @@ import asyncio
 import time
 import requests
 import subprocess
-from pathlib import Path
 from playwright.async_api import async_playwright
 
 # ===== 配置 =====
 BASE_URL = "https://www.ting13.cc"
 BOOK_KEY = os.environ.get("BOOK_KEY", "赘婿")
-# 可扩展多本小说的目录页 URL
 BOOK_URLS = {
-    "赘婿": f"{BASE_URL}/tingdirs/uiPlHh/cbbhASacUDuaQoFc.html?page=1&sort=asc",
+    "赘婿": f"{BASE_URL}/tingdirs/uiPlHh/cbbhASacUDuaQoFc.html",
+    # 未来可添加其他小说
 }
-DIR_URL = BOOK_URLS.get(BOOK_KEY)
-if not DIR_URL:
+BASE_DIR_URL = BOOK_URLS.get(BOOK_KEY)
+if not BASE_DIR_URL:
     raise ValueError(f"未配置小说 {BOOK_KEY} 的目录页")
 
-MAX_PER_RUN = 50                     # 每次最多处理章节数
-PROGRESS_FILE = "progress.json"      # 公开仓库根目录
+MAX_PER_RUN = 50
+PROGRESS_FILE = "progress.json"
 PRIVATE_REPO = os.environ["PRIVATE_REPO"]
 ACCESS_TOKEN = os.environ["ACCESS_TOKEN"]
-TARGET_DIR = f"public/{BOOK_KEY}"    # 私有仓库内目标文件夹
+TARGET_DIR = f"public/{BOOK_KEY}"
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 QQBrowser/21.1.8663.400"
 
@@ -40,55 +39,96 @@ def get_cookies():
     return cookies
 
 def load_progress():
-    """从公开仓库根目录读取 progress.json"""
     if not os.path.exists(PROGRESS_FILE):
         return {}
     with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def save_progress(progress):
-    """更新公开仓库的 progress.json"""
     with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
         json.dump(progress, f, ensure_ascii=False, indent=2)
 
 def sanitize_filename(title):
-    """清理文件名，返回不含扩展名的安全字符串"""
     name = re.sub(r'[\\/*?:"<>|]', "", title)
     if len(name) > 80:
         name = name[:80]
     return name.strip()
 
+async def get_total_pages(page):
+    """从首页解析总页数"""
+    page_list = await page.query_selector_all(".chapter-list-block li a")
+    max_page = 1
+    for item in page_list:
+        href = await item.get_attribute("href")
+        if href:
+            match = re.search(r"page=(\d+)", href)
+            if match:
+                p = int(match.group(1))
+                if p > max_page:
+                    max_page = p
+    return max_page
+
 async def fetch_all_chapters(cookies):
-    """用 Playwright 获取目录页完整章节列表"""
+    """遍历所有分页，获取完整章节列表"""
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-http2"])
-        context = await browser.new_context(user_agent=USER_AGENT,
-                                            viewport={"width": 1280, "height": 720},
-                                            locale="zh-CN")
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-http2", "--disable-gpu"]
+        )
+        context = await browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1280, "height": 720},
+            locale="zh-CN"
+        )
         await context.add_cookies([
             {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
             for k, v in cookies.items()
         ])
-        page = await context.new_page()
-        await page.goto(DIR_URL, wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(3)
 
-        chapters = await page.evaluate('''() => {
-            const ul = document.querySelector("#playlist ul");
-            if (!ul) return [];
-            const lis = ul.querySelectorAll("li a");
-            return Array.from(lis).map(a => ({
-                title: a.getAttribute("title") || a.innerText.trim(),
-                url: a.href
-            }));
-        }''')
+        # 先打开首页，获取总页数
+        page = await context.new_page()
+        print(f"正在获取首页: {BASE_DIR_URL}?page=1&sort=asc")
+        await page.goto(f"{BASE_DIR_URL}?page=1&sort=asc", wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(3)
+        total_pages = await get_total_pages(page)
+        print(f"📖 共检测到 {total_pages} 页")
+        await page.close()
+
+        all_chapters = []
+        for pg in range(1, total_pages + 1):
+            print(f"  抓取第 {pg}/{total_pages} 页...", end=" ")
+            page = await context.new_page()
+            try:
+                await page.goto(
+                    f"{BASE_DIR_URL}?page={pg}&sort=asc",
+                    wait_until="domcontentloaded",
+                    timeout=30000
+                )
+                await asyncio.sleep(2)
+                chs = await page.evaluate('''() => {
+                    const ul = document.querySelector("#playlist ul");
+                    if (!ul) return [];
+                    const lis = ul.querySelectorAll("li a");
+                    return Array.from(lis).map(a => ({
+                        title: a.getAttribute("title") || a.innerText.trim(),
+                        url: a.href
+                    }));
+                }''')
+                all_chapters.extend(chs)
+                print(f"获取 {len(chs)} 集")
+            except Exception as e:
+                print(f"失败 ({e})，跳过")
+            finally:
+                await page.close()
+            time.sleep(1)  # 礼貌延时
+
         await browser.close()
-        return chapters
+        return all_chapters
 
 async def fetch_audio_url(play_url, cookies):
-    """打开播放页，拦截 /api/mapi/play 获取音频地址"""
+    """打开播放页，拦截音频 API"""
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-http2"])
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-http2", "--disable-gpu"])
         context = await browser.new_context(user_agent=USER_AGENT)
         await context.add_cookies([
             {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
@@ -124,7 +164,8 @@ async def fetch_audio_url(play_url, cookies):
         return captured.get("name", ""), captured.get("url", "")
 
 def download_audio(url, filepath):
-    """下载音频文件"""
+    """下载音频，自动创建父目录"""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
     resp = requests.get(url, headers={"User-Agent": USER_AGENT}, stream=True, timeout=120)
     resp.raise_for_status()
     with open(filepath, "wb") as f:
@@ -133,7 +174,6 @@ def download_audio(url, filepath):
     return True
 
 def clone_private_repo():
-    """克隆私有仓库到临时目录"""
     repo_url = f"https://{ACCESS_TOKEN}@github.com/{PRIVATE_REPO}.git"
     tmp_dir = "/tmp/private_repo"
     subprocess.run(["rm", "-rf", tmp_dir], check=False)
@@ -141,7 +181,6 @@ def clone_private_repo():
     return tmp_dir
 
 def commit_and_push(repo_path, message):
-    """在给定路径下提交并推送所有更改"""
     subprocess.run(["git", "-C", repo_path, "config", "user.email", "actions@github.com"], check=True)
     subprocess.run(["git", "-C", repo_path, "config", "user.name", "GitHub Actions"], check=True)
     subprocess.run(["git", "-C", repo_path, "add", "."], check=True)
@@ -154,7 +193,6 @@ def commit_and_push(repo_path, message):
         print("ℹ️ 没有文件变更，无需推送")
 
 def update_index_json(repo_path, book_key, entries):
-    """更新 public/<book>/index.json，按 episode 去重排序"""
     index_dir = os.path.join(repo_path, TARGET_DIR)
     os.makedirs(index_dir, exist_ok=True)
     index_path = os.path.join(index_dir, "index.json")
@@ -167,7 +205,6 @@ def update_index_json(repo_path, book_key, entries):
             except:
                 existing = []
 
-    # 用 episode 去重
     episode_set = {e["episode"] for e in existing}
     for entry in entries:
         if entry["episode"] not in episode_set:
@@ -192,38 +229,37 @@ async def main():
     # 2. 获取完整章节列表
     chapters = await fetch_all_chapters(cookies)
     total_chapters = len(chapters)
-    print(f"📚 目录共 {total_chapters} 个章节")
+    print(f"📚 共获取到 {total_chapters} 个章节")
     if total_chapters == 0:
         print("❌ 无法获取章节列表，退出")
         return
 
     book_progress["total_chapters"] = total_chapters
 
-    # 3. 确定本次处理范围
+    # 3. 确定本次范围
     end_index = min(start_index + MAX_PER_RUN - 1, total_chapters)
     if start_index > total_chapters:
         print("✅ 所有章节已爬取完毕")
         return
-    print(f"⚡ 本次将处理第 {start_index} 到第 {end_index} 集")
+    print(f"⚡ 本次处理第 {start_index} ~ {end_index} 集")
 
     # 4. 克隆私有仓库
     repo_path = clone_private_repo()
 
     # 5. 逐章处理
     new_entries = []
-    for idx in range(start_index - 1, end_index):  # 0-based index
+    for idx in range(start_index - 1, end_index):
         ch = chapters[idx]
         episode_num = idx + 1
         title = ch["title"]
         play_url = ch["url"]
-        print(f"\n🎯 处理第 {episode_num} 集: {title}")
+        print(f"\n🎯 第 {episode_num} 集: {title}")
 
         audio_name, audio_url = await fetch_audio_url(play_url, cookies)
         if not audio_url:
             print("   ⚠️ 未获取到音频地址，跳过")
             continue
 
-        # 生成文件名（无后缀）
         base_name = sanitize_filename(audio_name if audio_name else title)
         actual_filename = base_name + ".m4a"
         dest_path = os.path.join(repo_path, TARGET_DIR, actual_filename)
@@ -239,25 +275,23 @@ async def main():
             "name": base_name,
             "title": audio_name if audio_name else title,
             "episode": episode_num,
-            "url": f"{BOOK_KEY}/{actual_filename}"   # 例如 "赘婿/xxx.m4a"
+            "url": f"{BOOK_KEY}/{actual_filename}"
         })
         time.sleep(1)
 
-    # 6. 更新私有仓库索引并推送
+    # 6. 更新索引并推送
     if new_entries:
         update_index_json(repo_path, BOOK_KEY, new_entries)
-        commit_and_push(repo_path, f"自动抓取 {BOOK_KEY} 第{start_index}-{end_index}集")
+        commit_and_push(repo_path, f"抓取 {BOOK_KEY} 第{start_index}-{end_index}集")
     else:
         print("ℹ️ 本次未下载任何新音频")
 
-    # 7. 更新进度并写回公开仓库
+    # 7. 保存进度
     if new_entries:
         book_progress["last_index"] = end_index
         progress[BOOK_KEY] = book_progress
         save_progress(progress)
-        print(f"📈 进度已更新：last_index = {end_index}")
-    else:
-        print("ℹ️ 未更新进度")
+        print(f"📈 进度更新：last_index = {end_index}")
 
 if __name__ == "__main__":
     asyncio.run(main())
