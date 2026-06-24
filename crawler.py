@@ -27,11 +27,18 @@ def sanitize_filename(title):
 # ===== 登录 (Playwright) =====
 async def login(playwright):
     raw = os.environ.get("TING13", "")
-    if "-----" not in raw: raise RuntimeError("TING13 格式错误")
+    if "-----" not in raw:
+        raise RuntimeError("TING13 格式错误")
     username, password = raw.split("-----", 1)
 
-    browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-http2", "--disable-gpu"])
-    context = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 720})
+    browser = await playwright.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-http2", "--disable-gpu"]
+    )
+    context = await browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1280, "height": 720}
+    )
     page = await context.new_page()
 
     print("🔐 正在打开登录页面...")
@@ -39,73 +46,121 @@ async def login(playwright):
     await page.wait_for_selector("#slider", state="visible", timeout=15000)
     await asyncio.sleep(2)
 
+    # 填入账号密码
     await page.fill('input[name="username"]', username)
     await page.fill('input[name="password"]', password)
+    await asyncio.sleep(0.5)
 
-    # 滑块验证：先尝试拖拽，失败则 JS 强制通过
-    slider = page.locator("#slider")
-    container = page.locator(".slider-container")
-    success = False
-    for attempt in range(3):
-        print(f"  尝试拖拽 (第{attempt+1}次)...")
-        slider_box = await slider.bounding_box()
-        cont_box = await container.bounding_box()
-        if not slider_box or not cont_box:
-            continue
-        start_x = slider_box['x'] + slider_box['width'] / 2
-        start_y = slider_box['y'] + slider_box['height'] / 2
-        end_x = cont_box['x'] + cont_box['width'] - slider_box['width'] / 2
-        await page.mouse.move(start_x, start_y)
-        await page.mouse.down()
-        steps = 40
-        for i in range(1, steps + 1):
-            x = start_x + (end_x - start_x) * i / steps
-            await page.mouse.move(x, start_y)
-            await asyncio.sleep(0.02)
-        await page.mouse.up()
-        await asyncio.sleep(1)
-        text = await page.text_content("#sliderText")
-        print(f"  滑块状态: {text}")
-        if "验证通过" in text:
-            success = True
-            break
-
-    if not success:
-        print("  拖拽失败，使用 JS 强制验证并提交表单...")
-        await page.evaluate('''() => {
-            const slider = document.getElementById('slider');
-            const container = slider.parentElement;
-            slider.style.left = (container.offsetWidth - slider.offsetWidth) + 'px';
-            const token = Math.random().toString(36).substring(2, 18);
-            document.getElementById('verificationToken').value = token;
-            document.getElementById('sliderText').innerText = '验证通过';
-            const btn = document.getElementById('loginButton');
-            btn.disabled = false;
-            document.getElementById('frmpassedit').submit();
-        }''')
-        await asyncio.sleep(2)
-        text = await page.text_content("#sliderText")
-        print(f"  JS 后状态: {text}")
-
-    # 等待跳转到用户中心（自动提交或手动）
-    print("  等待登录跳转...")
+    # ===== 方案：JS 直接模拟完整登录流程 =====
+    # 1. 生成 token
+    # 2. POST store_token.html
+    # 3. 等待完成后 submit 表单
+    # 全程在页面 JS 中执行，Playwright 只需等待跳转
+    
+    print("  使用 JS 完整模拟登录流程...")
+    
+    # 先设置验证状态（不触发 submit）
+    await page.evaluate('''() => {
+        const slider = document.getElementById('slider');
+        const container = slider.parentElement;
+        // 移动滑块到最右
+        slider.style.left = (container.offsetWidth - slider.offsetWidth) + 'px';
+        // 更新文本
+        document.getElementById('sliderText').innerText = '验证通过';
+        // 生成 token
+        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+        let token = '';
+        for (let i = 0; i < 16; i++) {
+            token += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+        document.getElementById('verificationToken').value = token;
+        // 启用按钮
+        document.getElementById('loginButton').disabled = false;
+        // 存储 token 到 window 供外部读取
+        window._loginToken = token;
+    }''')
+    
+    await asyncio.sleep(0.5)
+    
+    # 读取生成的 token
+    token = await page.evaluate("() => window._loginToken")
+    print(f"  生成 token: {token}")
+    
+    # POST store_token.html（模拟 fetch）
+    print("  POST store_token.html...")
+    store_resp = await page.evaluate('''async (token) => {
+        try {
+            const resp = await fetch('/user/public/store_token.html', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({token: token})
+            });
+            return {status: resp.status, ok: resp.ok};
+        } catch(e) {
+            return {error: e.toString()};
+        }
+    }''', token)
+    print(f"  store_token 响应: {store_resp}")
+    
+    await asyncio.sleep(0.5)
+    
+    # 提交表单 + 等待跳转（并发执行，避免时序问题）
+    print("  提交登录表单，等待跳转...")
     try:
-        await page.wait_for_url("**/user/index/index.html", timeout=30000)
-    except:
-        # 如果超时，再次强制提交表单
-        print("  跳转超时，再次尝试提交...")
-        await page.evaluate("document.getElementById('frmpassedit').submit()")
-        await page.wait_for_url("**/user/index/index.html", timeout=15000)
+        async with page.expect_navigation(
+            url="**/user/index/index.html",
+            wait_until="domcontentloaded",
+            timeout=30000
+        ):
+            await page.evaluate("() => document.getElementById('frmpassedit').submit()")
+        print("✅ 登录成功（form submit）")
+    except Exception as e:
+        print(f"  form submit 等待超时: {e}")
+        # 检查当前 URL
+        current_url = page.url
+        print(f"  当前页面: {current_url}")
+        
+        if "user/index" in current_url:
+            print("✅ 实际上已登录成功")
+        else:
+            # 最后尝试：直接点击登录按钮
+            print("  尝试点击登录按钮...")
+            try:
+                async with page.expect_navigation(
+                    url="**/user/index/index.html",
+                    wait_until="domcontentloaded",
+                    timeout=15000
+                ):
+                    await page.click("#loginButton")
+            except Exception as e2:
+                print(f"  点击按钮也失败: {e2}")
+                # 最终检查 cookie
+                cookies = await context.cookies()
+                cookie_names = [c['name'] for c in cookies]
+                print(f"  当前 cookies: {cookie_names}")
+                if "PTCMS_userid" not in cookie_names:
+                    await browser.close()
+                    raise RuntimeError(f"登录失败，当前页面: {page.url}")
 
-    print("✅ 登录成功")
+    # 验证登录 cookie
     cookies = await context.cookies()
+    cookie_dict = {c['name']: c['value'] for c in cookies}
+    if "PTCMS_userid" not in cookie_dict:
+        await browser.close()
+        raise RuntimeError("登录失败：未获取到 PTCMS_userid cookie")
+    
+    print(f"✅ 登录验证通过，用户ID: {cookie_dict.get('PTCMS_userid')}")
     await browser.close()
-    return {c['name']: c['value'] for c in cookies}
+    return cookie_dict
+
 
 # ===== 目录抓取 =====
 async def fetch_chapters(playwright, cookies_dict):
     req_ctx = await playwright.request.new_context(user_agent=USER_AGENT)
-    await req_ctx.add_cookies([{"name": k, "value": v, "domain": ".ting13.cc", "path": "/"} for k, v in cookies_dict.items()])
+    await req_ctx.add_cookies([
+        {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
+        for k, v in cookies_dict.items()
+    ])
 
     chapters = []
     max_page = 1
@@ -120,12 +175,16 @@ async def fetch_chapters(playwright, cookies_dict):
         s = BeautifulSoup(html, 'html.parser')
         div = s.find("div", id="playlist")
         if not div: return []
-        return [{"title": a.get("title","").strip(), "url": BASE_URL + a["href"]} for li in div.find_all("li") if (a := li.find("a")) and a.get("href")]
+        return [
+            {"title": a.get("title", "").strip(), "url": BASE_URL + a["href"]}
+            for li in div.find_all("li")
+            if (a := li.find("a")) and a.get("href")
+        ]
 
     chapters += parse_page(await resp.text())
     print(f"  第1页: {len(chapters)} 集")
 
-    for pg in range(2, max_page+1):
+    for pg in range(2, max_page + 1):
         resp = await req_ctx.get(f"{BASE_DIR_URL}?page={pg}&sort=asc")
         if resp.status != 200:
             print(f"  第{pg}页 失败 {resp.status}")
@@ -138,11 +197,18 @@ async def fetch_chapters(playwright, cookies_dict):
     await req_ctx.dispose()
     return chapters
 
+
 # ===== 音频地址 =====
 async def fetch_audio_url(playwright, play_url, cookies_dict):
-    browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-http2", "--disable-gpu"])
+    browser = await playwright.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-http2", "--disable-gpu"]
+    )
     context = await browser.new_context(user_agent=USER_AGENT)
-    await context.add_cookies([{"name": k, "value": v, "domain": ".ting13.cc", "path": "/"} for k, v in cookies_dict.items()])
+    await context.add_cookies([
+        {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
+        for k, v in cookies_dict.items()
+    ])
     page = await context.new_page()
     captured = {}
 
@@ -153,13 +219,16 @@ async def fetch_audio_url(playwright, play_url, cookies_dict):
                 if data.get("status") == 200:
                     captured["name"] = data.get("name")
                     captured["url"] = data.get("url")
-            except: pass
+            except:
+                pass
 
     page.on("response", on_response)
     try:
         await page.goto(play_url, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(3)
-        await page.evaluate("() => { const btn = document.querySelector('.play-btn,#playButton,.audio-play'); if(btn) btn.click(); }")
+        await page.evaluate(
+            "() => { const btn = document.querySelector('.play-btn,#playButton,.audio-play'); if(btn) btn.click(); }"
+        )
         await asyncio.sleep(3)
     except Exception as e:
         print(f"    播放页异常: {e}")
@@ -169,30 +238,47 @@ async def fetch_audio_url(playwright, play_url, cookies_dict):
         await browser.close()
     return captured.get("name", ""), captured.get("url", "")
 
+
 def download_audio(url, filepath):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    resp = requests.get(url, headers={"User-Agent": USER_AGENT}, stream=True, timeout=120)
+    resp = requests.get(
+        url,
+        headers={"User-Agent": USER_AGENT},
+        stream=True,
+        timeout=120
+    )
     resp.raise_for_status()
     with open(filepath, "wb") as f:
-        for chunk in resp.iter_content(8192): f.write(chunk)
+        for chunk in resp.iter_content(8192):
+            f.write(chunk)
     return True
+
 
 def clone_private_repo():
     subprocess.run(["rm", "-rf", "/tmp/private_repo"], check=False)
-    subprocess.run(["git", "clone", "--depth", "1", f"https://{ACCESS_TOKEN}@github.com/{PRIVATE_REPO}.git", "/tmp/private_repo"], check=True)
+    subprocess.run([
+        "git", "clone", "--depth", "1",
+        f"https://{ACCESS_TOKEN}@github.com/{PRIVATE_REPO}.git",
+        "/tmp/private_repo"
+    ], check=True)
     return "/tmp/private_repo"
+
 
 def commit_and_push(repo_path, msg):
     subprocess.run(["git", "-C", repo_path, "config", "user.email", "actions@github.com"], check=True)
     subprocess.run(["git", "-C", repo_path, "config", "user.name", "GitHub Actions"], check=True)
     subprocess.run(["git", "-C", repo_path, "add", "."], check=True)
-    status = subprocess.run(["git", "-C", repo_path, "status", "--porcelain"], capture_output=True, text=True).stdout
+    status = subprocess.run(
+        ["git", "-C", repo_path, "status", "--porcelain"],
+        capture_output=True, text=True
+    ).stdout
     if status.strip():
         subprocess.run(["git", "-C", repo_path, "commit", "-m", msg], check=True)
         subprocess.run(["git", "-C", repo_path, "push", "origin", "main"], check=True)
         print("✅ 私有仓库更新已推送")
     else:
         print("ℹ️ 无变更")
+
 
 def update_index_json(repo_path, entries):
     idx_dir = os.path.join(repo_path, TARGET_DIR)
@@ -201,8 +287,10 @@ def update_index_json(repo_path, entries):
     existing = []
     if os.path.exists(idx_path):
         with open(idx_path, "r", encoding="utf-8") as f:
-            try: existing = json.load(f)
-            except: pass
+            try:
+                existing = json.load(f)
+            except:
+                pass
     eps = {e["episode"] for e in existing}
     for e in entries:
         if e["episode"] not in eps:
@@ -212,6 +300,7 @@ def update_index_json(repo_path, entries):
     with open(idx_path, "w", encoding="utf-8") as f:
         json.dump(existing, f, ensure_ascii=False, indent=2)
     print(f"📄 index.json 更新至 {len(existing)} 集")
+
 
 async def main():
     progress = load_progress()
@@ -224,29 +313,39 @@ async def main():
         chapters = await fetch_chapters(p, cookies)
         total = len(chapters)
         print(f"📚 共获取 {total} 章节")
-        if not total: return
+        if not total:
+            return
         bp["total_chapters"] = total
         end = min(start + MAX_PER_RUN - 1, total)
         if start > total:
-            print("✅ 已全部爬完"); return
+            print("✅ 已全部爬完")
+            return
         print(f"⚡ 本次: 第{start}-{end}集")
 
         repo = clone_private_repo()
         entries = []
-        for i in range(start-1, end):
-            ch = chapters[i]; ep = i+1
+        for i in range(start - 1, end):
+            ch = chapters[i]
+            ep = i + 1
             print(f"\n🎯 第{ep}集: {ch['title']}")
             name, url = await fetch_audio_url(p, ch["url"], cookies)
             if not url:
-                print("   ⚠️ 未获取到音频链接"); continue
+                print("   ⚠️ 未获取到音频链接")
+                continue
             fname = sanitize_filename(name or ch['title']) + ".m4a"
             dest = os.path.join(repo, TARGET_DIR, fname)
             try:
                 download_audio(url, dest)
                 print(f"   ✅ 下载成功: {fname}")
             except Exception as e:
-                print(f"   ❌ 下载失败: {e}"); continue
-            entries.append({"name": fname[:-4], "title": name or ch['title'], "episode": ep, "url": f"{BOOK_KEY}/{fname}"})
+                print(f"   ❌ 下载失败: {e}")
+                continue
+            entries.append({
+                "name": fname[:-4],
+                "title": name or ch['title'],
+                "episode": ep,
+                "url": f"{BOOK_KEY}/{fname}"
+            })
             await asyncio.sleep(1)
 
         if entries:
@@ -256,6 +355,7 @@ async def main():
             progress[BOOK_KEY] = bp
             save_progress(progress)
             print(f"📈 进度已更新: last_index={end}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
