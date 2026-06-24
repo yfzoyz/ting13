@@ -28,16 +28,21 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 
 HEADERS = {
     "User-Agent": USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "zh-CN,zh;q=0.9",
-    "Upgrade-Insecure-Requests": "1",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "max-age=0",
     "Sec-Ch-Ua": '"Chromium";v="123", "Not:A-Brand";v="8"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"Windows"',
-    "Referer": BASE_URL,
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-User": "?1",
+    "Sec-Fetch-Dest": "document",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": "https://www.ting13.cc/tingdirs/uiPlHh/cbbhASacUDuaQoFc.html?page=9&sort=asc",
 }
 
-# ===== 工具函数 =====
 def get_cookies():
     raw = os.environ.get("TING13_COOKIES", "")
     if not raw:
@@ -72,8 +77,8 @@ def fetch_chapters_with_requests(cookies):
     session.cookies.update(cookies)
 
     all_chapters = []
+    max_page = 1
 
-    # 首先获取第一页，并解析总页数
     print(f"正在获取首页: {BASE_DIR_URL}?page=1&sort=asc")
     try:
         resp = session.get(f"{BASE_DIR_URL}?page=1&sort=asc", timeout=15)
@@ -87,7 +92,6 @@ def fetch_chapters_with_requests(cookies):
 
     # 提取总页数
     page_links = soup.select(".chapter-list-block li a")
-    max_page = 1
     for a in page_links:
         href = a.get("href", "")
         match = re.search(r"page=(\d+)", href)
@@ -99,15 +103,26 @@ def fetch_chapters_with_requests(cookies):
 
     # 解析第一页的章节
     playlist = soup.find("div", id="playlist")
-    if playlist:
-        for li in playlist.find_all("li"):
-            a = li.find("a")
-            if a and a.get("href"):
-                all_chapters.append({
-                    "title": a.get("title", "").strip(),
-                    "url": BASE_URL + a["href"]
-                })
-    print(f"  第1页获取 {len(all_chapters)} 集")
+    if not playlist:
+        # 打印调试信息
+        title_tag = soup.find("title")
+        page_title = title_tag.string if title_tag else "无标题"
+        print(f"❌ 未找到播放列表容器！")
+        print(f"页面标题：{page_title}")
+        print(f"页面文本片段（前500字符）：\n{resp.text[:500]}")
+        print("可能原因：Cookie 已过期，请更新 TING13_COOKIES")
+        return []
+    
+    chapter_count = 0
+    for li in playlist.find_all("li"):
+        a = li.find("a")
+        if a and a.get("href"):
+            all_chapters.append({
+                "title": a.get("title", "").strip(),
+                "url": BASE_URL + a["href"]
+            })
+            chapter_count += 1
+    print(f"  第1页获取 {chapter_count} 集")
 
     # 获取剩余页面
     for pg in range(2, max_page + 1):
@@ -135,7 +150,7 @@ def fetch_chapters_with_requests(cookies):
             print(f"获取 {count} 集")
         except Exception as e:
             print(f"失败 ({e})，跳过")
-        time.sleep(1)  # 礼貌延时
+        time.sleep(1)
 
     return all_chapters
 
@@ -239,12 +254,12 @@ async def main():
     start_index = book_progress["last_index"] + 1
     print(f"📖 当前进度：{BOOK_KEY} 已爬取 {book_progress['last_index']} 集，从第 {start_index} 集开始")
 
-    # 2. 获取完整章节列表（使用 requests，更稳定）
+    # 2. 获取完整章节列表
     chapters = fetch_chapters_with_requests(cookies)
     total_chapters = len(chapters)
     print(f"📚 共获取到 {total_chapters} 个章节")
     if total_chapters == 0:
-        print("❌ 无法获取章节列表，退出")
+        print("❌ 章节列表为空，请检查 Cookie 是否有效或网站是否可访问。退出。")
         return
 
     book_progress["total_chapters"] = total_chapters
