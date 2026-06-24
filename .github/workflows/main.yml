@@ -1,11 +1,7 @@
 name: 有声小说爬虫测试
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:          # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   test-crawler:
@@ -22,5 +18,7 @@ jobs:
       - name: 安装依赖
         run: pip install requests beautifulsoup4
 
-      - name: 运行爬虫测试
+      - name: 运行爬虫测试 (需登录)
+        env:
+          TING13_COOKIES: ${{ secrets.TING13_COOKIES }}   # 在仓库 Settings -> Secrets 中添加
         run: python test_crawler.py
