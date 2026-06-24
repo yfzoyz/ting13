@@ -1,6 +1,6 @@
 name: 有声小说爬虫
 
-于:
+on:
   schedule:
     - cron: '0 5 * * *'
   workflow_dispatch:
