@@ -1,3 +1,5 @@
+import sys
+sys.stdout.reconfigure(line_buffering=True)
 import os, re, json, asyncio, time, random, subprocess, requests
 from playwright.async_api import async_playwright
 
