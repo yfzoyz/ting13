@@ -17,7 +17,7 @@
 | `BASE_URL` | 网站根地址，固定为 `https://www.ting13.cc` |
 | `BOOK_URLS` | 字典，存储每本小说的目录页 URL。可在此处添加更多小说。 |
 | `DIR_URL` | 由 `BOOK_KEY` 从 `BOOK_URLS` 中取出，即当前爬取小说的目录页地址。 |
-| `MAX_PER_RUN` | 每次工作流运行最多处理的章节数，默认为 `50`。可根据需要调整（注意避免对网站造成过大压力）。 |
+| `MAX_PER_RUN` | 每次工作流运行最多处理的章节数，默认为 `60`。可根据需要调整（注意避免对网站造成过大压力）。 |
 | `PROGRESS_FILE` | 公开仓库中的进度记录文件名，固定为 `progress.json`。 |
 | `TARGET_DIR` | 私有仓库中的目标文件夹，格式为 `public/{BOOK_KEY}`（例如 `public/赘婿`）。音频文件及 `index.json` 均存放于此。 |
 | `USER_AGENT` | 模拟浏览器请求时使用的 User-Agent 字符串，尽量贴近真实浏览器以降低被反爬概率。 |
