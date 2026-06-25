@@ -58,6 +58,7 @@ jobs:
           PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
           BOOK_KEY: "赘婿"
+          PYTHONUNBUFFERED: 1          # 禁用输出缓冲
         run: python -u crawler.py
 
       - name: 推送 progress.json 到公开仓库
