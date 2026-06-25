@@ -3,7 +3,7 @@ from playwright.async_api import async_playwright
 
 BASE_URL = "https://www.ting13.cc"
 BOOK_KEY = os.environ.get("BOOK_KEY", "赘婿")
-NOVEL_PAGE = f"{BASE_URL}/youshengxiaoshuo/19353/"   # 小说固定主页
+NOVEL_PAGE = f"{BASE_URL}/youshengxiaoshuo/19353/"
 MAX_PER_RUN = 60
 PROGRESS_FILE = "progress.json"
 PRIVATE_REPO = os.environ["PRIVATE_REPO"]
@@ -77,7 +77,6 @@ async def login(playwright):
     return browser, cookie_dict
 
 async def get_dir_base_url(browser, cookies_dict):
-    """从小说主页自动提取最新的目录页基础 URL"""
     context = await browser.new_context(user_agent=USER_AGENT)
     await context.add_cookies([
         {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
@@ -94,7 +93,6 @@ async def get_dir_base_url(browser, cookies_dict):
                 print("  ⚠️ 被限流，等待 60 秒...")
                 await asyncio.sleep(60)
                 continue
-            # 从页面中提取目录链接
             dir_link = await page.evaluate('''() => {
                 const links = document.querySelectorAll('a[href*="/tingdirs/"]');
                 for (const a of links) {
@@ -103,18 +101,13 @@ async def get_dir_base_url(browser, cookies_dict):
                         return href;
                     }
                 }
+                const a = document.querySelector('a[href*="page=1&sort=asc"]');
+                if (a) {
+                    let href = a.getAttribute('href');
+                    return href.split('?')[0];
+                }
                 return null;
             }''')
-            if not dir_link:
-                # 备用：从播放列表的分页链接中提取
-                dir_link = await page.evaluate('''() => {
-                    const a = document.querySelector('a[href*="page=1&sort=asc"]');
-                    if (a) {
-                        let href = a.getAttribute('href');
-                        return href.split('?')[0];
-                    }
-                    return null;
-                }''')
             if not dir_link:
                 raise RuntimeError("未找到目录链接")
             full_url = BASE_URL + dir_link.split('?')[0]
@@ -155,7 +148,6 @@ async def fetch_page_chapters(browser, cookies_dict, base_url, page_num):
                     url: a.href
                 }));
             }''')
-            # 检测倒序并反转
             if chapters:
                 first_nums = re.findall(r'\d+', chapters[0]['title'])
                 last_nums = re.findall(r'\d+', chapters[-1]['title'])
@@ -192,17 +184,30 @@ async def fetch_audio_url(browser, play_url, cookies_dict):
                 pass
 
     page.on("response", on_response)
-    try:
-        await page.goto(play_url, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(3)
-        await page.evaluate("() => { const btn = document.querySelector('.play-btn,#playButton,.audio-play'); if(btn) btn.click(); }")
-        await asyncio.sleep(3)
-    except Exception as e:
-        print(f"    播放页异常: {e}")
-    finally:
-        page.remove_listener("response", on_response)
-        await page.close()
-        await context.close()
+    for retry in range(2):
+        try:
+            await page.goto(play_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(4)
+            # 强制触发播放器加载
+            await page.evaluate("""() => {
+                const btn = document.querySelector('.play-btn,#playButton,.audio-play');
+                if (btn) btn.click();
+                const audio = document.querySelector('audio');
+                if (audio) audio.play();
+            }""")
+            await asyncio.sleep(6)
+            if captured:
+                break
+            print("    (未捕获到，等待更长时间...)")
+            await asyncio.sleep(4)
+        except Exception as e:
+            print(f"    播放页异常: {e}")
+        if retry < 1:
+            print("    重试...")
+            await asyncio.sleep(3)
+    page.remove_listener("response", on_response)
+    await page.close()
+    await context.close()
     return captured.get("name", ""), captured.get("url", "")
 
 def download_audio(url, filepath):
@@ -293,17 +298,18 @@ async def main():
             return
 
         start_ep = (page_num - 1) * 60 + 1
-        end_ep = start_ep + len(page_chapters) - 1
-        print(f"📥 将下载第 {start_ep} ~ {end_ep} 集")
+        print(f"📥 开始下载第 {start_ep} 集起...")
 
         repo = clone_private_repo()
         entries = []
+        max_success_ep = start - 1
+
         for i, ch in enumerate(page_chapters):
             ep = start_ep + i
             print(f"\n🎯 第{ep}集: {ch['title']}")
             name, url = await fetch_audio_url(browser, ch["url"], cookies)
             if not url:
-                print("   ⚠️ 未获取到音频链接")
+                print("   ⚠️ 未获取到音频链接，跳过")
                 continue
             base_name = sanitize_filename(name or ch['title'])
             fname = base_name + ".m4a"
@@ -311,25 +317,25 @@ async def main():
             try:
                 download_audio(url, dest)
                 print(f"   ✅ 下载成功: {fname}")
+                entries.append({
+                    "name": base_name,
+                    "episode": ep,
+                    "url": f"{BOOK_KEY}/{fname}"
+                })
+                max_success_ep = ep
             except Exception as e:
                 print(f"   ❌ 下载失败: {e}")
                 if os.path.exists(dest):
                     os.remove(dest)
-                continue
-            entries.append({
-                "name": base_name,
-                "episode": ep,
-                "url": f"{BOOK_KEY}/{fname}"
-            })
             await asyncio.sleep(random.uniform(1, 2))
 
         if entries:
             update_index_json(repo, entries)
-            commit_and_push(repo, f"抓取 {BOOK_KEY} 第{start_ep}-{end_ep}集")
-            bp["last_index"] = end_ep
+            commit_and_push(repo, f"抓取 {BOOK_KEY} 第{start_ep}-{max_success_ep}集")
+            bp["last_index"] = max_success_ep
             progress[BOOK_KEY] = bp
             save_progress(progress)
-            print(f"📈 进度已更新: last_index={end_ep}")
+            print(f"📈 进度已更新: last_index={max_success_ep}")
         else:
             print("ℹ️ 无新文件，进度未更新")
 
