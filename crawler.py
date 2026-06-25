@@ -3,9 +3,12 @@ from playwright.async_api import async_playwright
 
 BASE_URL = "https://www.ting13.cc"
 BOOK_KEY = os.environ.get("BOOK_KEY", "赘婿")
-BOOK_URLS = {"赘婿": f"{BASE_URL}/tingdirs/uiPlHh/cbbhASacUDucKtDb.html"}
+# 目录页 URL（已更新）
+BOOK_URLS = {
+    "赘婿": f"{BASE_URL}/tingdirs/uiPlHh/cbbhASacUDuhOsFb.html"
+}
 BASE_DIR_URL = BOOK_URLS[BOOK_KEY]
-MAX_PER_RUN = 60
+MAX_PER_RUN = 60                    # 每次下载一整页（60集）
 PROGRESS_FILE = "progress.json"
 PRIVATE_REPO = os.environ["PRIVATE_REPO"]
 ACCESS_TOKEN = os.environ["ACCESS_TOKEN"]
@@ -78,60 +81,7 @@ async def login(playwright):
     await context.close()
     return browser, cookie_dict
 
-# ===== 获取总章节数（首次运行） =====
-async def get_total_chapters(browser, cookies_dict):
-    context = await browser.new_context(user_agent=USER_AGENT)
-    await context.add_cookies([
-        {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
-        for k, v in cookies_dict.items()
-    ])
-    page = await context.new_page()
-
-    print("📊 正在获取总章节数...")
-    await page.goto(f"{BASE_DIR_URL}?page=1&sort=asc", wait_until="domcontentloaded", timeout=60000)
-    # 等待可见的播放列表
-    await page.wait_for_selector("#playlist", state="visible", timeout=15000)
-
-    # 提取最大页码（即使快速选集容器隐藏，链接依然存在）
-    max_page = await page.evaluate('''() => {
-        const items = document.querySelectorAll('.chapter-list-block a[href*="page="]');
-        let max = 1;
-        items.forEach(a => {
-            const m = a.href.match(/page=(\d+)/);
-            if (m) {
-                const num = parseInt(m[1], 10);
-                if (num > max) max = num;
-            }
-        });
-        return max;
-    }''')
-    print(f"  最大页码: {max_page}")
-
-    last_page_chs = 0
-    if max_page > 1:
-        try:
-            await page.goto(f"{BASE_DIR_URL}?page={max_page}&sort=asc", wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_selector("#playlist", state="visible", timeout=15000)
-            last_page_chs = await page.evaluate('''() => {
-                const items = document.querySelectorAll("#playlist ul li a");
-                return items.length;
-            }''')
-        except Exception as e:
-            print(f"  获取最后一页失败: {e}，假设为60集")
-            last_page_chs = 60
-    else:
-        last_page_chs = await page.evaluate('''() => {
-            const items = document.querySelectorAll("#playlist ul li a");
-            return items.length;
-        }''')
-
-    total = (max_page - 1) * 60 + last_page_chs
-    print(f"📚 总章节数: {total}")
-    await page.close()
-    await context.close()
-    return total
-
-# ===== 获取指定页的章节列表 =====
+# ===== 获取指定页的章节列表（带重试和限流检测） =====
 async def fetch_page_chapters(browser, cookies_dict, page_num):
     context = await browser.new_context(user_agent=USER_AGENT)
     await context.add_cookies([
@@ -141,21 +91,32 @@ async def fetch_page_chapters(browser, cookies_dict, page_num):
     page = await context.new_page()
 
     url = f"{BASE_DIR_URL}?page={page_num}&sort=asc"
-    print(f"  请求目录页: {url}")
-    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    await page.wait_for_selector("#playlist", state="visible", timeout=15000)
-
-    chapters = await page.evaluate('''() => {
-        const items = document.querySelectorAll("#playlist ul li a");
-        return Array.from(items).map(a => ({
-            title: a.getAttribute("title") || a.innerText.trim(),
-            url: a.href
-        }));
-    }''')
-
+    for attempt in range(3):
+        try:
+            await asyncio.sleep(random.uniform(2, 4))
+            print(f"  请求目录页: {url} (尝试 {attempt+1}/3)")
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            if "请求过于频繁" in await page.title():
+                print("  ⚠️ 被限流，等待 30 秒后重试...")
+                await asyncio.sleep(30)
+                continue
+            await page.wait_for_selector("#playlist", state="visible", timeout=15000)
+            chapters = await page.evaluate('''() => {
+                const items = document.querySelectorAll("#playlist ul li a");
+                return Array.from(items).map(a => ({
+                    title: a.getAttribute("title") || a.innerText.trim(),
+                    url: a.href
+                }));
+            }''')
+            await page.close()
+            await context.close()
+            return chapters
+        except Exception as e:
+            print(f"  失败: {e}")
+            await asyncio.sleep(5)
     await page.close()
     await context.close()
-    return chapters
+    raise RuntimeError(f"无法获取第 {page_num} 页章节")
 
 # ===== 音频地址获取 =====
 async def fetch_audio_url(browser, play_url, cookies_dict):
@@ -254,53 +215,38 @@ async def main():
         save_progress({})
 
     progress = load_progress()
-    bp = progress.get(BOOK_KEY, {"last_index": 0, "total_chapters": 0})
+    bp = progress.get(BOOK_KEY, {"last_index": 0})
     start = bp["last_index"] + 1
     print(f"📖 {BOOK_KEY} 已爬 {bp['last_index']} 集，从第 {start} 集开始")
 
     async with async_playwright() as p:
         browser, cookies = await login(p)
 
-        # 获取总章节数（仅首次）
-        total = bp.get("total_chapters", 0)
-        if not total:
-            try:
-                total = await get_total_chapters(browser, cookies)
-                bp["total_chapters"] = total
-                progress[BOOK_KEY] = bp
-                save_progress(progress)
-            except Exception as e:
-                print(f"❌ 获取总章节数失败: {e}，稍后重试")
-                await browser.close()
-                return
-        else:
-            print(f"📚 总章节数（缓存）: {total}")
-
-        if start > total:
-            print("✅ 已全部爬完")
-            await browser.close()
-            return
-
-        # 计算页码
+        # 计算当前页码（每页60集）
         page_num = (start - 1) // 60 + 1
-        print(f"⚡ 本次抓取第 {page_num} 页目录（集数: {start}~{min(start+59, total)}）")
+        print(f"⚡ 本次将抓取第 {page_num} 页（60集）")
 
-        page_chapters = await fetch_page_chapters(browser, cookies, page_num)
-        if not page_chapters:
-            print("❌ 未获取到章节数据")
+        try:
+            page_chapters = await fetch_page_chapters(browser, cookies, page_num)
+        except Exception as e:
+            print(f"❌ 获取目录失败: {e}")
             await browser.close()
             return
 
-        start_in_page = (start - 1) % 60
-        end_in_page = min(start_in_page + MAX_PER_RUN - 1, len(page_chapters) - 1)
-        end = start + (end_in_page - start_in_page)
-        print(f"  实际下载: 第 {start} ~ {end} 集")
+        if not page_chapters:
+            print("❌ 未获取到章节数据（可能已到达最后一页）")
+            await browser.close()
+            return
+
+        # 整页下载（从该页第1集开始，到最后一集）
+        start_ep = (page_num - 1) * 60 + 1
+        end_ep = start_ep + len(page_chapters) - 1
+        print(f"📥 将下载第 {start_ep} ~ {end_ep} 集")
 
         repo = clone_private_repo()
         entries = []
-        for i in range(start_in_page, end_in_page + 1):
-            ch = page_chapters[i]
-            ep = (page_num - 1) * 60 + i + 1
+        for i, ch in enumerate(page_chapters):
+            ep = start_ep + i
             print(f"\n🎯 第{ep}集: {ch['title']}")
             name, url = await fetch_audio_url(browser, ch["url"], cookies)
             if not url:
@@ -326,11 +272,12 @@ async def main():
 
         if entries:
             update_index_json(repo, entries)
-            commit_and_push(repo, f"抓取 {BOOK_KEY} 第{start}-{end}集")
-            bp["last_index"] = end
+            commit_and_push(repo, f"抓取 {BOOK_KEY} 第{start_ep}-{end_ep}集")
+            # 更新进度为最后一集
+            bp["last_index"] = end_ep
             progress[BOOK_KEY] = bp
             save_progress(progress)
-            print(f"📈 进度已更新: last_index={end}")
+            print(f"📈 进度已更新: last_index={end_ep}")
         else:
             print("ℹ️ 无新文件，进度未更新")
 
