@@ -1,7 +1,7 @@
 name: 有声小说爬虫
 on:
-  schedule:
-    - cron: '0 5 * * *'
+#  schedule:
+#    - cron: '0 5 * * *'
   workflow_dispatch:
 
 jobs:
@@ -58,8 +58,7 @@ jobs:
           PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
           BOOK_KEY: "赘婿"
-          PYTHONUNBUFFERED: 1          # 禁用输出缓冲
-        run: python -u crawler.py
+        run: python crawler.py
 
       - name: 推送 progress.json 到公开仓库
         if: always()
