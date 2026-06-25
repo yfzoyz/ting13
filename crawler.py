@@ -3,12 +3,8 @@ from playwright.async_api import async_playwright
 
 BASE_URL = "https://www.ting13.cc"
 BOOK_KEY = os.environ.get("BOOK_KEY", "赘婿")
-# 目录页 URL（已更新）
-BOOK_URLS = {
-    "赘婿": f"{BASE_URL}/tingdirs/uiPlHh/cbbhASacUDuhOsFb.html"
-}
-BASE_DIR_URL = BOOK_URLS[BOOK_KEY]
-MAX_PER_RUN = 60                    # 每次下载一整页（60集）
+NOVEL_PAGE = f"{BASE_URL}/youshengxiaoshuo/19353/"   # 小说固定主页
+MAX_PER_RUN = 60
 PROGRESS_FILE = "progress.json"
 PRIVATE_REPO = os.environ["PRIVATE_REPO"]
 ACCESS_TOKEN = os.environ["ACCESS_TOKEN"]
@@ -29,7 +25,6 @@ def sanitize_filename(title):
     name = re.sub(r'[\\/*?:"<>|]', "", title)
     return name[:80].strip()
 
-# ===== 登录 =====
 async def login(playwright):
     raw = os.environ.get("TING13", "")
     if "-----" not in raw:
@@ -81,8 +76,8 @@ async def login(playwright):
     await context.close()
     return browser, cookie_dict
 
-# ===== 获取指定页的章节列表（带重试和限流检测） =====
-async def fetch_page_chapters(browser, cookies_dict, page_num):
+async def get_dir_base_url(browser, cookies_dict):
+    """从小说主页自动提取最新的目录页基础 URL"""
     context = await browser.new_context(user_agent=USER_AGENT)
     await context.add_cookies([
         {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
@@ -90,15 +85,67 @@ async def fetch_page_chapters(browser, cookies_dict, page_num):
     ])
     page = await context.new_page()
 
-    url = f"{BASE_DIR_URL}?page={page_num}&sort=asc"
+    print("📌 正在从小说主页获取目录链接...")
+    for attempt in range(3):
+        try:
+            await asyncio.sleep(random.uniform(2, 4))
+            await page.goto(NOVEL_PAGE, wait_until="domcontentloaded", timeout=30000)
+            if "请求过于频繁" in await page.title():
+                print("  ⚠️ 被限流，等待 60 秒...")
+                await asyncio.sleep(60)
+                continue
+            # 从页面中提取目录链接
+            dir_link = await page.evaluate('''() => {
+                const links = document.querySelectorAll('a[href*="/tingdirs/"]');
+                for (const a of links) {
+                    const href = a.getAttribute('href');
+                    if (href && href.includes('tingdirs') && href.endsWith('.html')) {
+                        return href;
+                    }
+                }
+                return null;
+            }''')
+            if not dir_link:
+                # 备用：从播放列表的分页链接中提取
+                dir_link = await page.evaluate('''() => {
+                    const a = document.querySelector('a[href*="page=1&sort=asc"]');
+                    if (a) {
+                        let href = a.getAttribute('href');
+                        return href.split('?')[0];
+                    }
+                    return null;
+                }''')
+            if not dir_link:
+                raise RuntimeError("未找到目录链接")
+            full_url = BASE_URL + dir_link.split('?')[0]
+            print(f"✅ 当前目录页: {full_url}")
+            await page.close()
+            await context.close()
+            return full_url
+        except Exception as e:
+            print(f"  尝试 {attempt+1}/3 失败: {e}")
+            await asyncio.sleep(5)
+    await page.close()
+    await context.close()
+    raise RuntimeError("无法获取目录页 URL")
+
+async def fetch_page_chapters(browser, cookies_dict, base_url, page_num):
+    context = await browser.new_context(user_agent=USER_AGENT)
+    await context.add_cookies([
+        {"name": k, "value": v, "domain": ".ting13.cc", "path": "/"}
+        for k, v in cookies_dict.items()
+    ])
+    page = await context.new_page()
+
+    url = f"{base_url}?page={page_num}&sort=asc"
     for attempt in range(3):
         try:
             await asyncio.sleep(random.uniform(2, 4))
             print(f"  请求目录页: {url} (尝试 {attempt+1}/3)")
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             if "请求过于频繁" in await page.title():
-                print("  ⚠️ 被限流，等待 30 秒后重试...")
-                await asyncio.sleep(30)
+                print("  ⚠️ 被限流，等待 60 秒...")
+                await asyncio.sleep(60)
                 continue
             await page.wait_for_selector("#playlist", state="visible", timeout=15000)
             chapters = await page.evaluate('''() => {
@@ -108,6 +155,13 @@ async def fetch_page_chapters(browser, cookies_dict, page_num):
                     url: a.href
                 }));
             }''')
+            # 检测倒序并反转
+            if chapters:
+                first_nums = re.findall(r'\d+', chapters[0]['title'])
+                last_nums = re.findall(r'\d+', chapters[-1]['title'])
+                if first_nums and last_nums and int(first_nums[0]) > 100 and int(first_nums[0]) > int(last_nums[0]):
+                    print("  🔄 检测到倒序，反转列表")
+                    chapters.reverse()
             await page.close()
             await context.close()
             return chapters
@@ -118,7 +172,6 @@ async def fetch_page_chapters(browser, cookies_dict, page_num):
     await context.close()
     raise RuntimeError(f"无法获取第 {page_num} 页章节")
 
-# ===== 音频地址获取 =====
 async def fetch_audio_url(browser, play_url, cookies_dict):
     context = await browser.new_context(user_agent=USER_AGENT)
     await context.add_cookies([
@@ -152,7 +205,6 @@ async def fetch_audio_url(browser, play_url, cookies_dict):
         await context.close()
     return captured.get("name", ""), captured.get("url", "")
 
-# ===== 下载音频 =====
 def download_audio(url, filepath):
     if os.path.exists(filepath):
         os.remove(filepath)
@@ -164,7 +216,6 @@ def download_audio(url, filepath):
             f.write(chunk)
     return True
 
-# ===== Git 操作 =====
 def clone_private_repo():
     subprocess.run(["rm", "-rf", "/tmp/private_repo"], check=False)
     subprocess.run(["git", "clone", "--depth", "1", f"https://{ACCESS_TOKEN}@github.com/{PRIVATE_REPO}.git", "/tmp/private_repo"], check=True)
@@ -193,7 +244,6 @@ def update_index_json(repo_path, entries):
                 existing = json.load(f)
             except:
                 pass
-    # 移除旧 title
     for item in existing:
         item.pop("title", None)
 
@@ -208,9 +258,7 @@ def update_index_json(repo_path, entries):
         json.dump(existing, f, ensure_ascii=False, indent=2)
     print(f"📄 index.json 更新至 {len(existing)} 集")
 
-# ===== 主流程 =====
 async def main():
-    # 确保 progress.json 存在
     if not os.path.exists(PROGRESS_FILE):
         save_progress({})
 
@@ -222,12 +270,18 @@ async def main():
     async with async_playwright() as p:
         browser, cookies = await login(p)
 
-        # 计算当前页码（每页60集）
+        try:
+            base_url = await get_dir_base_url(browser, cookies)
+        except Exception as e:
+            print(f"❌ 获取目录页失败: {e}")
+            await browser.close()
+            return
+
         page_num = (start - 1) // 60 + 1
-        print(f"⚡ 本次将抓取第 {page_num} 页（60集）")
+        print(f"⚡ 本次抓取第 {page_num} 页目录")
 
         try:
-            page_chapters = await fetch_page_chapters(browser, cookies, page_num)
+            page_chapters = await fetch_page_chapters(browser, cookies, base_url, page_num)
         except Exception as e:
             print(f"❌ 获取目录失败: {e}")
             await browser.close()
@@ -238,7 +292,6 @@ async def main():
             await browser.close()
             return
 
-        # 整页下载（从该页第1集开始，到最后一集）
         start_ep = (page_num - 1) * 60 + 1
         end_ep = start_ep + len(page_chapters) - 1
         print(f"📥 将下载第 {start_ep} ~ {end_ep} 集")
@@ -273,7 +326,6 @@ async def main():
         if entries:
             update_index_json(repo, entries)
             commit_and_push(repo, f"抓取 {BOOK_KEY} 第{start_ep}-{end_ep}集")
-            # 更新进度为最后一集
             bp["last_index"] = end_ep
             progress[BOOK_KEY] = bp
             save_progress(progress)
