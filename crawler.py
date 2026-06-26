@@ -264,14 +264,17 @@ def download_audio(url, filepath):
 
 def clone_private_repo():
     subprocess.run(["rm", "-rf", "/tmp/private_repo"], check=False)
-    subprocess.run(["git", "clone", "--depth", "1", f"https://{ACCESS_TOKEN}@github.com/{PRIVATE_REPO}.git", "/tmp/private_repo"], check=True)
+    subprocess.run(["git", "clone", "--depth", "1",
+                    f"https://{ACCESS_TOKEN}@github.com/{PRIVATE_REPO}.git",
+                    "/tmp/private_repo"], check=True)
     return "/tmp/private_repo"
 
 def commit_and_push(repo_path, msg):
     subprocess.run(["git", "-C", repo_path, "config", "user.email", "actions@github.com"], check=True)
     subprocess.run(["git", "-C", repo_path, "config", "user.name", "GitHub Actions"], check=True)
     subprocess.run(["git", "-C", repo_path, "add", "."], check=True)
-    status = subprocess.run(["git", "-C", repo_path, "status", "--porcelain"], capture_output=True, text=True).stdout
+    status = subprocess.run(["git", "-C", repo_path, "status", "--porcelain"],
+                            capture_output=True, text=True).stdout
     if status.strip():
         subprocess.run(["git", "-C", repo_path, "commit", "-m", msg], check=True)
         subprocess.run(["git", "-C", repo_path, "push", "origin", "main"], check=True)
@@ -303,6 +306,30 @@ def update_index_json(repo_path, entries):
     with open(idx_path, "w", encoding="utf-8") as f:
         json.dump(existing, f, ensure_ascii=False, indent=2)
     print(f"📄 index.json 更新至 {len(existing)} 集")
+
+def update_novels_json(repo_path, book_key):
+    novels_path = os.path.join(repo_path, "novels.json")
+
+    # 读取已有数据
+    existing = []
+    if os.path.exists(novels_path):
+        with open(novels_path, "r", encoding="utf-8") as f:
+            try:
+                existing = json.load(f)
+            except:
+                existing = []
+
+    # 已存在则不重复写入
+    if book_key in existing:
+        print(f"ℹ️ {book_key} 已在 novels.json 中，跳过")
+        return False
+
+    # 新书追加写入
+    existing.append(book_key)
+    with open(novels_path, "w", encoding="utf-8") as f:
+        json.dump(existing, f, ensure_ascii=False, indent=2)
+    print(f"✅ 已将 {book_key} 写入 novels.json")
+    return True
 
 async def main():
     if not os.path.exists(PROGRESS_FILE):
@@ -415,6 +442,7 @@ async def main():
 
         if entries:
             update_index_json(repo, entries)
+            update_novels_json(repo, BOOK_KEY)  # ← 自动写入 novels.json
             commit_and_push(repo, f"抓取 {BOOK_KEY} 第{entries[0]['episode']}-{entries[-1]['episode']}集")
             bp["last_index"] = max_success_ep
             bp["page"] = page_num  # 保存当前页码
