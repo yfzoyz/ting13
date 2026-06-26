@@ -1,6 +1,6 @@
 ## 环境变量说明
 
-下表列出了代码中使用的所有环境变量，它们需要在 GitHub Actions 的 Secrets 或 workflow 的 `env` 中设置。
+下表列出了代码中使用的所有环境变量，它们需要在 GitHub Actions 的 Secrets 或 workflow 中设置。
 
 | 变量名 | 是否必需 | 说明 |
 |--------|----------|------|
