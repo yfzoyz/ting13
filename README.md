@@ -8,7 +8,8 @@
 | `PRIVATE_REPO` | ✅ 必需 | 存储音频文件的私有仓库全名，格式为 `owner/repo`（例如 `myuser/audiobooks-private`）。 |
 | `ACCESS_TOKEN` | ✅ 必需 | 具有访问上述私有仓库权限的 GitHub Personal Access Token（需勾选 `repo` 作用域），用于克隆和推送文件。 |
 | `GH_TOKEN` | ✅ 必需 | 用于将 `progress.json` 推回当前公开仓库的 GitHub Token（通常与 `ACCESS_TOKEN` 相同即可）。 |
-| `BOOK_KEY` | 可选 | 当前要抓取的小说标识，默认为 `"赘婿"`。若要抓取其他小说，可在 workflow 中修改或新增 `BOOK_URLS` 字典条目。 |
+| `BOOK_KEY` | ✅ 必需 | 当前要抓取的小说标识，默认为 `"赘婿"`。若要抓取其他小说，可在 workflow 中修改。 |
+| `NOVEL_PAGE` | ✅ 必需 | 小说的详情页地址，默认为 `"https://www.ting13.cc/youshengxiaoshuo/19353/"`若要抓取其他小说，可在 workflow 中修改。 |
 
 ## 代码中的关键配置变量
 
@@ -25,8 +26,6 @@
 ## Secrets 配置示例（GitHub 仓库 Settings → Secrets and variables → Actions）
 
 1. 新建 `TING13`，格式：账号-----密码。  
-2. 新建 `PRIVATE_REPO`，填入私有仓库全名（如 `myuser/my-private-storage`）。  
-3. 新建 `ACCESS_TOKEN`，填入生成的 Personal Access Token。  
-4. 新建 `GH_TOKEN`，可使用同一个 Token。  
-
-> 提示：Cookie 有时效性，若爬虫突然失败，请重新登录网站并更新 Secret 中的 Cookie。
+2. 新建 `PRIVATE_REPO`，填入私有仓库全名（如 `myuser/my-private-storage`）。 "私有仓库使用"
+3. 新建 `ACCESS_TOKEN`，填入生成的 Personal Access Token。  "私有仓库使用"
+4. 新建 `GH_TOKEN`，可使用同一个 Token。  "公开仓库使用"
