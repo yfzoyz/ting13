@@ -25,7 +25,13 @@
 
 ## Secrets 配置示例（GitHub 仓库 Settings → Secrets and variables → Actions）
 
-1. 新建 `TING13`，格式：账号-----密码。  "公开仓库使用"
-2. 新建 `PRIVATE_REPO`，填入私有仓库全名（如 `myuser/my-private-storage`）。 "私有仓库使用"
-3. 新建 `ACCESS_TOKEN`，填入生成的 Personal Access Token。  "私有仓库使用"
-4. 新建 `GH_TOKEN`，可使用同一个 Token。  "公开仓库使用"
+1. 新建 `TING13`，格式：账号-----密码。 
+2. 新建 `PRIVATE_REPO`，填入私有仓库全名（如 `myuser/my-private-storage`）。
+3. 新建 `ACCESS_TOKEN`，填入生成的 Personal Access Token。
+4. 新建 `GH_TOKEN`，可使用同一个 Token。
+
+> 💡 **简单记忆**：  
+> - `TING13` → 网站账号密码  
+> - `PRIVATE_REPO` + `ACCESS_TOKEN` → 私有仓库的“门牌号”和“钥匙”  
+> - `GH_TOKEN` → 公开仓库的提交钥匙  
+> - `BOOK_KEY` + `NOVEL_PAGE` → 你要下载哪本书、从哪个页面开始
