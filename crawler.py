@@ -3,7 +3,7 @@ from playwright.async_api import async_playwright
 
 BASE_URL = "https://www.ting13.cc"
 BOOK_KEY = os.environ.get("BOOK_KEY", "赘婿")
-NOVEL_PAGE = f"{BASE_URL}/youshengxiaoshuo/19353/"
+NOVEL_PAGE = os.environ.get("NOVEL_PAGE", f"{BASE_URL}/youshengxiaoshuo/19353/")
 MAX_PER_RUN = 60
 PROGRESS_FILE = "progress.json"
 PRIVATE_REPO = os.environ["PRIVATE_REPO"]
