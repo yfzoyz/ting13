@@ -1,0 +1,87 @@
+name: 朕 - 有声小说爬虫
+on:
+#  schedule:
+#    - cron: '0 5 * * *'
+  workflow_dispatch:
+
+jobs:
+  crawl:
+    name: 运行爬虫
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          pip install requests beautifulsoup4 playwright
+          playwright install --with-deps chromium
+
+      - name: 启用 WARP 网络
+        uses: fscarmen/warp-on-actions@v1.3
+        with:
+          stack: dual
+          mode: client
+
+      - name: 修复 DNS
+        run: |
+          echo "[INFO] 停用 systemd-resolved，设置公共 DNS..."
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo systemctl disable systemd-resolved 2>/dev/null || true
+
+          sudo rm -f /etc/resolv.conf
+          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1" | sudo tee /etc/resolv.conf
+
+          sleep 2
+
+          echo "[INFO] DNS 测试:"
+          nslookup host2play.gratis 1.1.1.1 || echo "[WARN] 解析失败"
+
+          echo ""
+          echo "[INFO] 当前出口 IP:"
+          curl -s --max-time 10 https://api.ipify.org && echo
+          echo "[INFO] WARP Trace:"
+          curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || true
+          
+      - name: 运行爬虫
+        env:
+          TING13: ${{ secrets.TING13 }}
+          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          BOOK_KEY: "朕"
+          NOVEL_PAGE: "https://www.ting13.cc/youshengxiaoshuo/19508/"
+        run: python crawler.py
+
+      - name: 推送 progress.json 到公开仓库
+        if: always()
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add progress.json
+          if git diff --staged --quiet; then
+            echo "进度无变化，跳过提交"
+          else
+            git commit -m "Update progress.json"
+            git pull --rebase origin main
+            git push origin main
+            echo "✅ 进度已推送到公开仓库"
+          fi
+
+      - name: 清理历史运行记录
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 0
+          keep_minimum_runs: 1
